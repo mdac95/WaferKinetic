@@ -8,9 +8,30 @@ version = "0.1.0"
 description = "Kinetic plasma simulation tools for semiconductor processing"
 readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }                      # or whatever you choose
+dependencies = [
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.8"]
+jax = ["jax>=0.4.30"]                           # CPU-only JAX
+cuda = ["jax[cuda12]>=0.4.30"]                  # GPU box: pip install -e ".[cuda]"
+dev = [
+    "pytest",
+    "ruff",
+    "waferkinetic[plot,jax]",                   # dev env gets everything
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[project.optional-dependencies]
-dev = ["pytest", "ruff"]
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "NPY"]            # I = import sorting, NPY = numpy rules
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
