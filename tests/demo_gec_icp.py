@@ -26,7 +26,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from reactor_mesh import (
+from waferkinetic.mesh.reactor_mesh import (
     Material, RectRegion, ReactorGeometry,
     tanh_grid, geometric_grid, composite_grid,
     Mesh2D, plot_reactor,
