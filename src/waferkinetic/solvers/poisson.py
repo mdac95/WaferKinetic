@@ -40,6 +40,35 @@ Physics (model document, Secs. 5.2-5.4, 12.1-12.2)
   by factors of 1e2-1e3 (doc Sec. 5.3 headline claim, asserted in
   test_poisson.py test 4), bounded by the Courant limit.
 
+* P3 -- fully implicit electron transport (Kushner 2009, J. Phys. D 42
+  194013, Sec. 3.1 option 3 *disambiguated*; selectable, off by
+  default). Option 3 as written (Eqs. 9a/9b) is ambiguous: reading
+  phi_e as OLD electron density x NEW potential reproduces option 2
+  exactly and removes nothing -- the P2 augmentation already makes the
+  *drift* term implicit in Phi; what stays explicit in P2 is the
+  electron *diffusion* term div grad(D_e n_e), which is precisely what
+  sets the ~1 ps limit on 0.3 mm cells at 10 mTorr (D_e = mu_e Te ~
+  1e4-1e5 m^2/s). P3 therefore makes n_e itself an unknown: backward
+  Euler on the FULL drift-diffusion divergence,
+
+      (1/dt + L_e[Phi]) n_e(t+dt) = n_e(t)/dt + S(t),
+
+  with L_e the SAME discrete operator as the explicit path (grad(D N)
+  diffusion, donor-cell drift, Eq. 36 thermal wall), so both schemes
+  share one fixed point; the electron energy density gets the identical
+  treatment (D_eps = 5/3 mu_e Te carries the same limit -- doing only
+  continuity gains nothing). Solved as a Gummel block iteration per
+  substep (transport solves <-> the unchanged P2 Poisson), with the P2
+  electron augmentation supplying the linearized drift response of the
+  already-solved n_e to the updated potential. The transport systems
+  are diagonally dominant M-matrices but NOT symmetric (upwinding +
+  grad(DN)): Jacobi-preconditioned BiCGStab in `custom_linear_solve`
+  with an explicit `transpose_solve` (never symmetric=True). Ions stay
+  explicit, so the remaining stability limit is ion sheath drift
+  (mu_i E ~ 1e5-1e6 m/s -> ~0.1-1 ns on 0.3 mm cells) plus the
+  retained sheath-RC and chemical-stiffness caps: a ~2-3 decade gain
+  over the electron-diffusion limit, not five.
+
 * Discretization: cell-centered finite volume on the exact axisymmetric
   metrics of `Mesh2D` (doc Sec. 12.1). Phi is solved in `solved`
   materials (default PLASMA + DIELECTRIC; the dielectric window carries
@@ -609,32 +638,149 @@ _limit_wall = _limit_outflow
 
 def _species_fluxes(top: TransportOperator, pop: PoissonOperator,
                     ne, ni, Te, Er, Ez, p: FKPMParams,
-                    dt_e=None, dt_i=None):
+                    dt_e=None, dt_i=None, ion_wall: str = "thermal",
+                    wall_flux: str = "thermal", Phi=None,
+                    Er_i=None, Ez_i=None):
     """Full (interior + wall) face fluxes for electrons and the ion at the
     given field: doc Eq. 23 drift-diffusion + Eq. 36/37 walls.  When a
     species dt is given, its wall fluxes are positivity-limited with
     `_limit_outflow` (required whenever the fluxes feed a time
     update)."""
+    if ion_wall == "bohm":
+        M_i = 8.0 * QE * p.T_i_eV / (np.pi * p.vth_i ** 2)
+        vth_eff = np.maximum(p.vth_i,
+                             4.0 * np.sqrt(QE * np.maximum(Te, p.Te_min)
+                                           / M_i))
+    else:
+        vth_eff = p.vth_i * np.ones_like(ne)
     mu_e = p.mu_e * np.ones_like(ne)
     cp = 0.5 * (1.0 - p.re) / (1.0 + p.re)
     vth_e = np.sqrt(8.0 * QE * Te / (np.pi * ME))
     Fr_e, Fz_e = flux_drift_diffusion(top, ne, mu_e * Te, mu_e, -1.0, Er, Ez)
     Wr, Wz = wall_flux_thermal(top, ne, vth_e, cp)
+    if wall_flux == "sheath" and Phi is not None:
+        # Boltzmann throttle of the unresolved sheath, mirroring the
+        # jitted `sheath_r`/`sheath_z`: WITHOUT this the dumped electron
+        # wall flux is the raw thermal one while the run used the
+        # throttled one, and diagnostics built on the dump report
+        # spurious charge imbalance at floating surfaces (observed:
+        # Ge/Gi = 6.8 at a plateaued dielectric; corrected ~1.05).
+        PW, PE = _face_vals_r(Phi)
+        TW, TE = _face_vals_r(np.maximum(Te, p.Te_min))
+        TW = np.where(TW > 0, TW, 1.0)
+        TE = np.where(TE > 0, TE, 1.0)
+        br = 1.0 + np.where(top.wall_e, np.exp(-np.maximum(PW - PE, 0.0)
+                                               / TW) - 1.0, 0.0)             + np.where(top.wall_w, np.exp(-np.maximum(PE - PW, 0.0)
+                                          / TE) - 1.0, 0.0)
+        PS, PN = _face_vals_z(Phi)
+        TS, TN = _face_vals_z(np.maximum(Te, p.Te_min))
+        TS = np.where(TS > 0, TS, 1.0)
+        TN = np.where(TN > 0, TN, 1.0)
+        bz = 1.0 + np.where(top.wall_n, np.exp(-np.maximum(PS - PN, 0.0)
+                                               / TS) - 1.0, 0.0)             + np.where(top.wall_s, np.exp(-np.maximum(PN - PS, 0.0)
+                                          / TN) - 1.0, 0.0)
+        Wr, Wz = br * Wr, bz * Wz
     Fr_e, Fz_e = Fr_e + Wr, Fz_e + Wz
     if dt_e is not None:
         Fr_e, Fz_e = _limit_outflow(top, ne, Fr_e, Fz_e, dt_e)
-    Fr_i, Fz_i = flux_drift_diffusion(top, ni, p.D_i, p.mu_i, +1.0, Er, Ez)
-    Wr, Wz = wall_flux_ion(top, ni, p.mu_i, +1.0, Er, Ez, p.vth_i, 1.0)
+    # ions may drift in the Richards effective field (ion_field=
+    # "effective"): pass it so dumped fluxes match what the run used
+    Eri = Er if Er_i is None else Er_i
+    Ezi = Ez if Ez_i is None else Ez_i
+    Fr_i, Fz_i = flux_drift_diffusion(top, ni, p.D_i, p.mu_i, +1.0,
+                                      Eri, Ezi)
+    Wr, Wz = wall_flux_ion(top, ni, p.mu_i, +1.0, Eri, Ezi, vth_eff, 1.0)
     Fr_i, Fz_i = Fr_i + Wr, Fz_i + Wz
     if dt_i is not None:
         Fr_i, Fz_i = _limit_outflow(top, ni, Fr_i, Fz_i, dt_i)
     return (Fr_e, Fz_e), (Fr_i, Fz_i)
 
 
+def _implicit_electron_solve(top: TransportOperator, ne, Te, Er, Ez, S,
+                             p: FKPMParams, dt, tol: float = 1.0e-10,
+                             maxiter: int = 2000):
+    """NumPy reference backward-Euler electron-continuity solve of the
+    P3 scheme (module docstring): (1/dt + L_e[E]) n = ne/dt + S with
+    L_e the SAME discrete operator as the explicit path
+    (`flux_drift_diffusion` grad(DN) form + donor-cell drift +
+    Eq. 36 thermal wall), coefficients frozen at the given (Te, E) so
+    the system is linear. Matrix-free scipy BiCGStab (the operator is
+    a diagonally dominant M-matrix but not symmetric).
+
+    Returns (n_new, (Fr, Fz)) with the operator fluxes evaluated AT THE
+    SOLUTION -- the only fluxes that keep the sigma_s charge ledger
+    exact against the solved density (the density change equals
+    dt*(-div F(n_new) + S) to solver tolerance, so charging the walls
+    with any other flux leaks charge). No positivity limiter: backward
+    Euler with donor-cell upwinding is unconditionally positivity-
+    preserving for a nonnegative RHS, and limiting the implicit fluxes
+    would break the ledger against the solved densities.
+    """
+    from scipy.sparse.linalg import LinearOperator, bicgstab
+
+    shape = ne.shape
+    mu_e = p.mu_e * np.ones(shape)
+    D = mu_e * Te
+    vth = np.sqrt(8.0 * QE * Te / (np.pi * ME))
+    cw = 0.5 * (1.0 - p.re) / (1.0 + p.re)
+    dtc = np.broadcast_to(np.asarray(dt, float), shape)
+    inv_dt = 1.0 / np.where(dtc > 0.0, dtc, 1.0)
+
+    def op_flux(x):
+        Fr, Fz = flux_drift_diffusion(top, x, D, mu_e, -1.0, Er, Ez)
+        Wr, Wz = wall_flux_thermal(top, x, vth, cw)
+        return Fr + Wr, Fz + Wz
+
+    def mv(xf):
+        x = xf.reshape(shape)
+        Fr, Fz = op_flux(x)
+        return np.where(top.active, inv_dt * x + divergence(top, Fr, Fz),
+                        x).ravel()
+
+    # exact diagonal for the Jacobi preconditioner: the cell's own
+    # coefficient in its outgoing flux through each face (interior D/dc
+    # + outgoing upwind |v|; thermal coefficient on wall faces)
+    mW, mE = _face_vals_r(mu_e)
+    vr = -0.5 * (mW + mE) * Er
+    mS, mN = _face_vals_z(mu_e)
+    vz = -0.5 * (mS + mN) * Ez
+    cE = np.where(top.int_r[1:, :], D / top.dc_r[1:, :]
+                  + np.maximum(vr[1:, :], 0.0), 0.0) \
+        + np.where(top.wall_e[1:, :], cw * vth, 0.0)
+    cWc = np.where(top.int_r[:-1, :], D / top.dc_r[:-1, :]
+                   + np.maximum(-vr[:-1, :], 0.0), 0.0) \
+        + np.where(top.wall_w[:-1, :], cw * vth, 0.0)
+    cN = np.where(top.int_z[:, 1:], D / top.dc_z[:, 1:]
+                  + np.maximum(vz[:, 1:], 0.0), 0.0) \
+        + np.where(top.wall_n[:, 1:], cw * vth, 0.0)
+    cS = np.where(top.int_z[:, :-1], D / top.dc_z[:, :-1]
+                  + np.maximum(-vz[:, :-1], 0.0), 0.0) \
+        + np.where(top.wall_s[:, :-1], cw * vth, 0.0)
+    diag = np.where(top.active, inv_dt
+                    + (top.area_r[1:, :] * cE + top.area_r[:-1, :] * cWc
+                       + top.area_z[:, 1:] * cN
+                       + top.area_z[:, :-1] * cS) / top.volume,
+                    1.0).ravel()
+
+    b = np.where(top.active, inv_dt * ne + S, 0.0).ravel()
+    A = LinearOperator((ne.size, ne.size), matvec=mv, dtype=float)
+    M = LinearOperator((ne.size, ne.size), matvec=lambda y: y / diag,
+                       dtype=float)
+    try:
+        x, _ = bicgstab(A, b, x0=ne.ravel(), M=M, rtol=tol, atol=0.0,
+                        maxiter=maxiter)
+    except TypeError:                          # scipy < 1.12 keyword
+        x, _ = bicgstab(A, b, x0=ne.ravel(), M=M, tol=tol, atol=0.0,
+                        maxiter=maxiter)
+    n_new = x.reshape(shape)
+    return n_new, op_flux(n_new)
+
+
 def fkpm_step(top: TransportOperator, pop: PoissonOperator,
               ne, ni, ss_r, ss_z, Phi, Te, S, p: FKPMParams,
               dt_e, dt_i, scheme: str = "p2",
-              phi_dir: np.ndarray | None = None):
+              phi_dir: np.ndarray | None = None,
+              n_gummel: int = 2, implicit_tol: float = 1.0e-10):
     """One P1/P2 step of the coupled (ne, ni, sigma_s, Phi) system --
     NumPy reference for the jitted stepper (direct sparse Poisson solve).
 
@@ -645,11 +791,76 @@ def fkpm_step(top: TransportOperator, pop: PoissonOperator,
     with the unaugmented potential of the current charge (doc Eq. 28);
     dt must resolve eps0/sigma_DC.
 
+    P2I (module docstring P3, Kushner option 3 disambiguated): the
+    electron density is an unknown of a backward-Euler transport solve
+    Gummel-iterated `n_gummel` times against the unchanged P2 Poisson
+    solve; each sweep is [Poisson at the latest solved n_e] ->
+    [implicit electron solve at the new field], ending on the transport
+    solve so the returned density is the exact backward-Euler solution
+    at the returned field and sigma_s is charged from the same operator
+    fluxes (exact ledger). Ions stay explicit (limiter retained); the
+    electron positivity limiter is off (M-matrix). The electron dt is
+    no longer diffusion-bounded; ion Courant still binds dt_i.
+
     Te is held fixed here (doc Sec. 12.3 sub-slicing; the coupled jitted
     stepper also advances n_eps). Returns (ne', ni', ss_r', ss_z', Phi',
     Er, Ez).
     """
     rho = np.where(pop.plasma, QE * (ni - ne), 0.0)
+    if scheme == "p2i":
+        mu_e = p.mu_e * np.ones_like(ne)
+        vth_e = np.sqrt(8.0 * QE * Te / (np.pi * ME))
+        cw = 0.5 * (1.0 - p.re) / (1.0 + p.re)
+        dtw_e = np.broadcast_to(np.asarray(dt_e, float), ne.shape)
+        dtw_i = np.broadcast_to(np.asarray(dt_i, float), ne.shape)
+        dtf_er = np.maximum(*_face_vals_r(dtw_e))
+        dtf_ez = np.maximum(*_face_vals_z(dtw_e))
+        dtf_ir = np.maximum(*_face_vals_r(dtw_i))
+        dtf_iz = np.maximum(*_face_vals_z(dtw_i))
+
+        ne_g, Phi_g = ne, Phi
+        Fr_e = Fz_e = Er = Ez = None
+        for _ in range(max(int(n_gummel), 1)):
+            # (a) P2 Poisson at the latest solved electron density; the
+            # electron drift response to the future potential is carried
+            # by the (unchanged) augmentation, cancelled at a stationary
+            # point by the delta form.
+            Er0, Ez0 = pop.efield(Phi_g, phi_dir)
+            _, (Fr_i, Fz_i) = _species_fluxes(top, pop, ne_g, ni, Te,
+                                              Er0, Ez0, p,
+                                              dt_e=None, dt_i=dt_i)
+            ni_p = ni + dt_i * (-divergence(top, Fr_i, Fz_i) + S)
+            Fr_e0, Fz_e0 = flux_drift_diffusion(top, ne_g, mu_e * Te,
+                                                mu_e, -1.0, Er0, Ez0)
+            Wr, Wz = wall_flux_thermal(top, ne_g, vth_e, cw)
+            dsr_e, dsz_e = pop.charging([(-QE, Fr_e0 + Wr, Fz_e0 + Wz)])
+            dsr_i, dsz_i = pop.charging([(QE, Fr_i, Fz_i)])
+            ssr_p = ss_r + dtf_er * dsr_e + dtf_ir * dsr_i
+            ssz_p = ss_z + dtf_ez * dsz_e + dtf_iz * dsz_i
+            gaug_r, gaug_z = p2_augmentation(pop, mu_e * ne_g,
+                                             p.mu_i * ni, dt_e, dt_i)
+            aug_only = pop.matvec(Phi_g, gaug_r, gaug_z) \
+                - pop.matvec(Phi_g)
+            rho_p = np.where(pop.plasma, QE * (ni_p - ne_g), 0.0)
+            Phi_g = pop.solve_direct(rho_p, ssr_p, ssz_p, phi_dir,
+                                     gaug_r, gaug_z, rhs_extra=aug_only)
+            # (b) backward-Euler electron continuity at the NEW field.
+            Er, Ez = pop.efield(Phi_g, phi_dir)
+            ne_g, (Fr_e, Fz_e) = _implicit_electron_solve(
+                top, ne, Te, Er, Ez, S, p, dt_e, tol=implicit_tol)
+
+        # final explicit ion update at the final field (limiter on);
+        # sigma_s charged from each species' ACTUAL update fluxes.
+        _, (Fr_i, Fz_i) = _species_fluxes(top, pop, ne_g, ni, Te, Er, Ez,
+                                          p, dt_e=None, dt_i=dt_i)
+        ne_new = np.maximum(ne_g, 0.0)
+        ni_new = np.maximum(ni + dt_i * (-divergence(top, Fr_i, Fz_i)
+                                         + S), 0.0)
+        dsr_e, dsz_e = pop.charging([(-QE, Fr_e, Fz_e)])
+        dsr_i, dsz_i = pop.charging([(QE, Fr_i, Fz_i)])
+        ss_r_new = ss_r + dtf_er * dsr_e + dtf_ir * dsr_i
+        ss_z_new = ss_z + dtf_ez * dsz_e + dtf_iz * dsz_i
+        return ne_new, ni_new, ss_r_new, ss_z_new, Phi_g, Er, Ez
     if scheme == "p1":
         Phi_new = pop.solve_direct(rho, ss_r, ss_z, phi_dir)
     elif scheme == "p2":
@@ -808,9 +1019,22 @@ def make_jax_poisson_solver(tol: float = 1e-9, maxiter: int = 4000):
             return jnp.where(pc.solved > 0.5, ax, x)
 
         def inner(matvec, bb):
+            # Warm-start breakdown guard, same disease as `imsolve`: at
+            # a converged outer state x0 already solves the system, the
+            # initial residual sits at rounding noise, and the CG
+            # recurrence forms alpha = <r,z>/<p,Ap> = 0/0 -- returning
+            # NaN or finite garbage. A garbage POTENTIAL is worse than a
+            # garbage density: the electron solve then faithfully solves
+            # its linear system at the insane field, so a residual test
+            # on the transport solve alone passes (8e77 really was the
+            # solution of its system). Accept CG's answer only if it
+            # fits Poisson at least as well as the warm start.
             x, _ = cg(matvec, bb, x0=x0, M=lambda y: y / diag,
-                      tol=tol, atol=0.0, maxiter=maxiter)
-            return x
+                      tol=tol, atol=tol * 1.0e-3, maxiter=maxiter)
+            r_new = jnp.linalg.norm(matvec(x) - bb)
+            r_ref = jnp.linalg.norm(matvec(x0) - bb)
+            ok = jnp.isfinite(r_new) & (r_new <= r_ref)
+            return jnp.where(ok, x, x0)
 
         return jax.lax.custom_linear_solve(mv, b, solve=inner,
                                            symmetric=True)
@@ -822,7 +1046,14 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                           p: FKPMParams, source_fn=None, inelastic_fn=None,
                           evolve_energy: bool = False, n_sub: int = 100,
                           cg_tol: float = 1e-8, cg_maxiter: int = 2000,
-                          courant_clip: float | None = None):
+                          courant_clip: float | None = None,
+                          es_joule: str = "drift",
+                          wall_flux: str = "thermal",
+                          ion_wall: str = "thermal",
+                          ion_field: str = "static",
+                          implicit_electrons: bool = False,
+                          n_gummel: int = 2, im_tol: float = 1e-9,
+                          im_maxiter: int = 2000):
     """Return a jitted coupled FKPM stepper
 
         step(ne, ni, n_eps, ss_r, ss_z, Phi, dt_e, dt_i, dt_eps, S_ext_eV)
@@ -853,6 +1084,40 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
     differentiable end to end: the Poisson solve is wrapped in
     `custom_linear_solve`, the substep loop is a static-trip-count
     `fori_loop`.
+
+    implicit_electrons (P3, module docstring; default False leaves the
+    explicit path bit-for-bit unchanged): electron continuity AND the
+    energy density become unknowns of backward-Euler transport solves
+    -- the full drift-diffusion divergence acts on the future density,
+    removing the explicit electron-diffusion limit (~1 ps on 0.3 mm
+    cells at 10 mTorr; D_eps = 5/3 mu_e Te carries the identical limit,
+    so both are done). Per substep, `n_gummel` Gummel sweeps of
+    [P2 Poisson at the latest solved n_e] -> [implicit electron solve at
+    the new field] -> [implicit energy solve], with the P2 electron
+    augmentation as the linearized drift response of the solved density
+    to the potential update; the delta form still cancels it at a
+    stationary point. Coefficients (D_e, face drift velocity, wall
+    v_th) are frozen within a sweep at the sweep-entry Te and field, so
+    each solve is linear; particle/inelastic/elastic sources are frozen
+    at substep entry, S(n^t, Te^t). The solves are Jacobi-preconditioned
+    BiCGStab (im_tol/im_maxiter) in `custom_linear_solve` with an
+    EXPLICIT transpose_solve -- the upwinded operator is non-symmetric;
+    symmetric=True would silently corrupt reverse-mode gradients while
+    leaving forward results correct. All species share ONE per-cell
+    pseudo-clock: min of the supplied dt ceilings (chemistry caps from
+    the caller), the in-loop ion Courant clip, and the sheath-RC
+    charging limit (coupled field-charge dynamics -- NOT redundant with
+    implicit electron transport); electron/energy transport rates no
+    longer enter. The electron positivity limiter is off on this path
+    (backward Euler + upwinding is an M-matrix, unconditionally
+    positivity-preserving; limiting the implicit fluxes would break the
+    charge ledger against the solved densities), the ion limiter stays.
+    sigma_s is charged from the operator fluxes reconstructed at the
+    SOLVED densities and the final-sweep field -- exactly the fluxes
+    that produced the density change -- so the discrete charge ledger
+    is exact. Remaining stability limit: ion sheath drift (~0.1-1 ns on
+    0.3 mm cells), i.e. a ~2-3 decade gain over the electron-diffusion
+    bound.
     """
     import jax
     import jax.numpy as jnp
@@ -905,9 +1170,10 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
         fz = jnp.where(Fz > 0.0, padS(th), padN(th)) * Fz
         return fr, fz
 
-    def e_fluxes(N, D, mu, sign, Er, Ez, vth, cw, dt):
+    def e_fluxes(N, D, mu, sign, Er, Ez, vth, cw, dt, br=1.0, bz=1.0):
         """grad(DN) diffusion + donor-cell drift + thermal wall (Eq. 36),
-        wall part positivity-limited."""
+        wall part positivity-limited. br/bz are the `sheath_r`/`sheath_z`
+        wall multipliers (1.0 on the thermal path)."""
         G = D * N
         f = cw * vth * N
         vr = sign * 0.5 * (padW(mu) + padE(mu)) * Er
@@ -916,15 +1182,29 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
         vz = sign * 0.5 * (padS(mu) + padN(mu)) * Ez
         Fz = tc.int_z * (-(padN(G) - padS(G)) / tc.dc_z
                          + vz * jnp.where(vz > 0.0, padS(N), padN(N)))
-        Wr = tc.wall_e * padW(f) - tc.wall_w * padE(f)
-        Wz = tc.wall_n * padS(f) - tc.wall_s * padN(f)
+        Wr = br * (tc.wall_e * padW(f) - tc.wall_w * padE(f))
+        Wz = bz * (tc.wall_n * padS(f) - tc.wall_s * padN(f))
         return limit_outflow(N, Fr + Wr, Fz + Wz, dt)
 
-    def i_fluxes(N, Er, Ez, dt):
+    def i_fluxes(N, Er, Ez, dt, Te=None):
         """Ion drift-diffusion + Eq. 37 wall (thermal + gated drift),
-        wall part positivity-limited."""
+        wall part positivity-limited.
+
+        ion_wall == "bohm": the wall coefficient is floored at the Bohm
+        speed u_B = sqrt(q Te / M). Drift-diffusion ions at T_i = T_g
+        reach the wall at 0.25 vth_i ~ 100 m/s where the sheath-edge
+        criterion demands u_B ~ 3e3 m/s: the missing presheath
+        acceleration makes the ion loss ~30x too small, and the
+        floating condition dPhi/Te = ln(c_p vth_e / Gamma_i-per-ion)
+        then pushes the potential to ~ln(vth_e/vth_i) ~ 8 Te instead of
+        ~5 Te (measured: 6.5 at the wafer with the drift assist).
+        DEPARTS FROM doc Eq. 37; amend it before quoting results."""
         G = p.D_i * N
-        th = 0.25 * p.vth_i * N
+        if ion_wall == "bohm" and Te is not None:
+            ub = _uB(jnp.maximum(Te, p.Te_min))
+            th = jnp.maximum(0.25 * p.vth_i, ub) * N
+        else:
+            th = 0.25 * p.vth_i * N
         vr = p.mu_i * Er
         Fr = tc.int_r * (-(padE(G) - padW(G)) / tc.dc_r
                          + vr * jnp.where(vr > 0.0, padW(N), padE(N)))
@@ -999,9 +1279,115 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
              + tc.area_z[:, 1:] * coef_z[:, 1:]
              + tc.area_z[:, :-1] * coef_z[:, :-1]) / tc.volume)
 
+    if es_joule not in ("drift", "flux"):
+        raise ValueError("es_joule must be 'drift' or 'flux'")
+    if wall_flux not in ("thermal", "sheath"):
+        raise ValueError("wall_flux must be 'thermal' or 'sheath'")
+    if ion_wall not in ("thermal", "bohm"):
+        raise ValueError("ion_wall must be 'thermal' or 'bohm'")
+    if ion_field not in ("static", "effective"):
+        raise ValueError("ion_field must be 'static' or 'effective'")
+    if ion_field == "effective" and not implicit_electrons:
+        raise NotImplementedError(
+            "ion_field='effective' is implemented on the implicit (P3) "
+            "path only; the explicit stepper is kept verbatim")
+    _eff = ion_field == "effective"
+    #: Bohm speed u_B = sqrt(q Te / M) from the ion parameters:
+    #: mass via the thermal speed identity vth_i = sqrt(8 q Ti / pi M)
+    _MI = 8.0 * QE * p.T_i_eV / (jnp.pi * p.vth_i ** 2)
+
+    def _uB(Te):
+        return jnp.sqrt(QE * Te / _MI)
+
+    #: Richards et al. (APL 50, 492 (1987); Economou tutorial Eq. 6;
+    #: doc Sec. 5.1 option 2 closing remark) ion momentum-transfer
+    #: frequency, self-consistent with the code's own mobility via
+    #: nu_i = q/(M mu_i). The ions drift in an EFFECTIVE field obeying
+    #:     dE_eff/dt = nu_i (E_S - E_eff),
+    #: a low-pass filter representing inertia: ions cannot follow field
+    #: structure faster than their momentum relaxation (~ {:.1e} s at
+    #: these parameters), which is precisely what the drift-diffusion
+    #: closure wrongly lets them do inside the smeared sheath.
+    _NU_I = QE / (_MI * p.mu_i)
+
+    def sheath_r(Phi, Te):
+        """Multiplier on the r-direction electron wall flux.
+
+        "thermal" (doc Eq. 36): 1 -- the one-sided thermal flux
+        (1-re)/(1+re) (1/2) v_th n_e, with NO dependence on the
+        potential. That is only correct on a sheath-resolving mesh,
+        where n_e in the wall cell is already depleted. Here
+        lambda_D ~ 0.02-0.2 mm against ~2.5 mm cells, so the depletion
+        cannot be represented and the electron loss cannot be throttled
+        by the sheath: sigma_s charges without a restoring feedback and
+        the potential overshoots.
+
+        "sheath": exp(-(Phi_plasma - Phi_wall)/Te), the Boltzmann factor
+        of the unresolved sheath drop across the face. This gives the
+        wall flux a Phi dependence, which (a) lets the surface-charge
+        balance close, and (b) throttles Gamma_e toward the ion flux,
+        cutting the differential response dGamma_e/dPhi = -Gamma_e/Te
+        that sets the explicit stability limit. DEPARTS FROM doc
+        Eq. 36; amend it before quoting any result produced this way.
+        """
+        if wall_flux == "thermal":
+            return 1.0
+        tW = jnp.maximum(padW(Te), p.Te_min)
+        tE = jnp.maximum(padE(Te), p.Te_min)
+        fE = jnp.exp(-jnp.maximum(padW(Phi) - padE(Phi), 0.0) / tW)
+        fW = jnp.exp(-jnp.maximum(padE(Phi) - padW(Phi), 0.0) / tE)
+        return 1.0 + tc.wall_e * (fE - 1.0) + tc.wall_w * (fW - 1.0)
+
+    def sheath_z(Phi, Te):
+        if wall_flux == "thermal":
+            return 1.0
+        tS = jnp.maximum(padS(Te), p.Te_min)
+        tN = jnp.maximum(padN(Te), p.Te_min)
+        fN = jnp.exp(-jnp.maximum(padS(Phi) - padN(Phi), 0.0) / tS)
+        fS = jnp.exp(-jnp.maximum(padN(Phi) - padS(Phi), 0.0) / tN)
+        return 1.0 + tc.wall_n * (fN - 1.0) + tc.wall_s * (fS - 1.0)
+
+    def es_heating(ne_c, mu_c, Erc, Ezc, Fr_e, Fz_e):
+        """Electrostatic heating of the electron fluid, eV m^-3 s^-1.
+
+        "drift" (default, doc Eq. 12 / Kushner 2009 Eq. 5):
+            S = mu_e ne |E_S|^2
+        the Joule term of a PURE-DRIFT electron flux.
+
+        "flux": S = -Gamma_e . E_S, the work done by the field on the
+        actual discrete electron flux -- the same face fluxes that
+        advance the density, restricted to interior faces and averaged
+        to cell centres like Erc/Ezc. Since Gamma_e = -mu_e ne E
+        - grad(De ne), this equals the drift form PLUS the diffusive
+        part, and the two very nearly cancel in an ambipolar plasma
+        (net Gamma_e is the small ambipolar flux, not the drift flux).
+        The drift-only form keeps a positive-definite source that
+        cannot switch off; at GEC conditions it overstates the
+        electrostatic heating by orders of magnitude, so this option
+        exists to quantify that. NOTE: selecting "flux" departs from
+        the model document -- Eq. 12 must be amended to match before
+        any result produced with it is quoted.
+        """
+        if es_joule == "drift":
+            return ne_c * mu_c * (Erc ** 2 + Ezc ** 2)
+        Frc = 0.5 * (tc.int_r[:-1, :] * Fr_e[:-1, :]
+                     + tc.int_r[1:, :] * Fr_e[1:, :])
+        Fzc = 0.5 * (tc.int_z[:, :-1] * Fz_e[:, :-1]
+                     + tc.int_z[:, 1:] * Fz_e[:, 1:])
+        return -(Frc * Erc + Fzc * Ezc)
+
     def clip_dt(dt0, rate):
+        # `rate` is exactly zero wherever the clipped mechanism is absent
+        # (rate_q vanishes in every cell with no wall face, i.e. the bulk).
+        # Guarding only the SELECT is not enough: the unselected branch is
+        # still evaluated, and reverse mode then forms 0 * d(1/rate) =
+        # 0 * inf = NaN, poisoning the whole adjoint even though the
+        # forward value is correct. The denominator itself must be made
+        # safe -- the same double-`where` idiom `limit_outflow` already
+        # uses. Forward values are bit-identical.
+        safe = jnp.where(rate > 0.0, rate, 1.0)
         return jnp.where(rate > 0.0,
-                         jnp.minimum(dt0, courant_clip / rate), dt0)
+                         jnp.minimum(dt0, courant_clip / safe), dt0)
 
     def step(ne, ni, n_eps, ss_r, ss_z, Phi, dt_e, dt_i, dt_eps, S_ext_eV):
         shape = ne.shape
@@ -1010,7 +1396,7 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
         dtp0 = jnp.broadcast_to(jnp.asarray(dt_eps, jnp.float64), shape)
 
         def body(_, st):
-            ne, ni, n_eps, ss_r, ss_z, Phi = st
+            ne, ni, n_eps, ss_r, ss_z, Phi, dt_acc = st
             ne_eff = jnp.maximum(ne, p.ne_floor)
             Te = jnp.clip((2.0 / 3.0) * n_eps / ne_eff, p.Te_min, p.Te_max)
             mu_e = mu_e_s * jnp.ones_like(ne)
@@ -1040,21 +1426,38 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                 # at kV scale during sheath formation from uncharged
                 # walls. Self-relaxing: as the sheath charges, E grows
                 # and the wall cell depletes, so the limit fades.
+                # On the sheath path the electron wall flux is throttled
+                # by exp(-dPhi/Te) and, crucially, RESPONDS to Phi: the
+                # quantity that limits an explicit sigma_s update is the
+                # differential conductance dGamma_e/dPhi = -Gamma_e/Te,
+                # not the net current (which nearly vanishes at ambipolar
+                # balance and makes the clip ~6x too permissive). Using
+                # the throttled Gamma_e here both fixes that estimate and
+                # relaxes it, since Gamma_e -> Gamma_i at balance.
                 fe_c = cp * vth_e * ne
-                fi_c = 0.25 * p.vth_i * ni
+                if ion_wall == "bohm":
+                    fi_c = jnp.maximum(0.25 * p.vth_i,
+                                       _uB(jnp.maximum(Te, p.Te_min))) * ni
+                else:
+                    fi_c = 0.25 * p.vth_i * ni
                 mi_ni = p.mu_i * ni
                 # NET charging current: gross (fe + fi) would keep
                 # throttling a fully formed sheath forever; the field-
                 # change limit only cares about the imbalance. During
                 # sheath formation ions are static so net ~ fe anyway.
-                gw_r = (tc.wall_e * jnp.abs(padW(fe_c) - padW(fi_c)
-                                            - padW(mi_ni) * jnp.abs(Er0))
-                        + tc.wall_w * jnp.abs(padE(fe_c) - padE(fi_c)
-                                              - padE(mi_ni) * jnp.abs(Er0)))
-                gw_z = (tc.wall_n * jnp.abs(padS(fe_c) - padS(fi_c)
-                                            - padS(mi_ni) * jnp.abs(Ez0))
-                        + tc.wall_s * jnp.abs(padN(fe_c) - padN(fi_c)
-                                              - padN(mi_ni) * jnp.abs(Ez0)))
+                brq, bzq = sheath_r(Phi, Te), sheath_z(Phi, Te)
+                gw_r = brq * (tc.wall_e * jnp.abs(padW(fe_c) - padW(fi_c)
+                                                  - padW(mi_ni)
+                                                  * jnp.abs(Er0))
+                              + tc.wall_w * jnp.abs(padE(fe_c) - padE(fi_c)
+                                                    - padE(mi_ni)
+                                                    * jnp.abs(Er0)))
+                gw_z = bzq * (tc.wall_n * jnp.abs(padS(fe_c) - padS(fi_c)
+                                                  - padS(mi_ni)
+                                                  * jnp.abs(Ez0))
+                              + tc.wall_s * jnp.abs(padN(fe_c) - padN(fi_c)
+                                                    - padN(mi_ni)
+                                                    * jnp.abs(Ez0)))
                 Te_fr = jnp.maximum(padW(Te), padE(Te))
                 Te_fz = jnp.maximum(padS(Te), padN(Te))
                 es_r = jnp.maximum(jnp.abs(Er0), Te_fr / tc.dc_r)
@@ -1102,7 +1505,7 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
             dti_fz = jnp.maximum(padS(dti), padN(dti))
             Fr_e, Fz_e = e_fluxes(ne, mu_e * Te, mu_e, -1.0, Er0, Ez0,
                                   vth_e, cp, dte)
-            Fr_i, Fz_i = i_fluxes(ni, Er0, Ez0, dti)
+            Fr_i, Fz_i = i_fluxes(ni, Er0, Ez0, dti, Te)
             ne_p = ne + dte * (-div(Fr_e, Fz_e) + S)
             ni_p = ni + dti * (-div(Fr_i, Fz_i) + S)
             dsr_e = QE * (pc.scW_r - pc.scE_r) * Fr_e   # electron q = -e
@@ -1119,9 +1522,10 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
 
             # ---- updates at the new field -------------------------------- #
             Er, Ez = efield(Phi)
+            br_w, bz_w = sheath_r(Phi, Te), sheath_z(Phi, Te)
             Fr_e, Fz_e = e_fluxes(ne, mu_e * Te, mu_e, -1.0, Er, Ez,
-                                  vth_e, cp, dte)
-            Fr_i, Fz_i = i_fluxes(ni, Er, Ez, dti)
+                                  vth_e, cp, dte, br_w, bz_w)
+            Fr_i, Fz_i = i_fluxes(ni, Er, Ez, dti, Te)
             ne = jnp.maximum(ne + dte * (-div(Fr_e, Fz_e) + S), 0.0)
             ni = jnp.maximum(ni + dti * (-div(Fr_i, Fz_i) + S), 0.0)
             ss_r = ss_r + dte_fr * QE * (pc.scW_r - pc.scE_r) * Fr_e \
@@ -1147,20 +1551,366 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                 PW, PE = padW(n_eps), padE(n_eps)
                 Fr = tc.int_r * (-(padE(G) - padW(G)) / tc.dc_r
                                  + vr * jnp.where(vr > 0.0, PW, PE)) \
-                    + tc.wall_e * padW(fw) - tc.wall_w * padE(fw)
+                    + br_w * (tc.wall_e * padW(fw) - tc.wall_w * padE(fw))
                 PS, PN = padS(n_eps), padN(n_eps)
                 Fz = tc.int_z * (-(padN(G) - padS(G)) / tc.dc_z
                                  + vz * jnp.where(vz > 0.0, PS, PN)) \
-                    + tc.wall_n * padS(fw) - tc.wall_s * padN(fw)
-                Se = S_ext_eV + ne * mu_e * (Erc ** 2 + Ezc ** 2) \
+                    + bz_w * (tc.wall_n * padS(fw) - tc.wall_s * padN(fw))
+                Se = S_ext_eV + es_heating(ne, mu_e, Erc, Ezc,
+                                           Fr_e, Fz_e) \
                     - 3.0 * p.mass_ratio * nu_m * ne * (Te - p.Tg_eV)
                 if inelastic_fn is not None:
                     Se = Se - inelastic_fn(ne, Te)
                 n_eps = jnp.maximum(n_eps + dtp * (-div(Fr, Fz) + Se), 0.0)
 
-            return ne, ni, n_eps, ss_r, ss_z, Phi
+            # accumulate the clock ACTUALLY taken: dte after the ion
+            # Courant re-clip, the sheath-RC limit and the smoothing
+            # sweeps. The dt arrays passed in are only ceilings, so this
+            # is the sole honest measure of how far a slice advances.
+            dt_acc = dt_acc + jnp.sum(dte * tc.active) \
+                / jnp.maximum(jnp.sum(tc.active), 1.0)
+            return ne, ni, n_eps, ss_r, ss_z, Phi, dt_acc
 
         return jax.lax.fori_loop(0, n_sub, body,
-                                 (ne, ni, n_eps, ss_r, ss_z, Phi))
+                                 (ne, ni, n_eps, ss_r, ss_z, Phi, 0.0))
 
-    return jax.jit(step)
+    if not implicit_electrons:
+        return jax.jit(step)
+
+    # ------------------------------------------------------------------ P3 --
+    # Fully implicit electron continuity + energy (module docstring P3;
+    # Kushner 2009 option 3 disambiguated). The explicit `step` above is
+    # untouched and remains the default.
+    from jax.scipy.sparse.linalg import bicgstab
+
+    def imsolve(mv, b, x0, diag):
+        """Backward-Euler transport solve: Jacobi-preconditioned
+        BiCGStab wrapped in `custom_linear_solve`. The operator
+        (1/dt + L) with donor-cell upwinding and grad(DN) diffusion is
+        a diagonally dominant M-matrix but NOT symmetric, so the
+        transpose solve is supplied explicitly (JAX builds vecmat = A^T
+        by linear transposition of `mv`); passing symmetric=True here
+        would silently corrupt reverse-mode gradients while leaving
+        forward results correct. diag(A^T) == diag(A), so one Jacobi
+        preconditioner serves both directions."""
+        # BiCGStab BREAKDOWN GUARD. The warm start is the previous
+        # solution, so as the outer iteration converges the initial
+        # residual underflows towards ~1e-16 ||b||; BiCGStab then forms
+        # rho = <r0, r> ~ 0 and alpha = rho / <r0, v> = 0/0, which can
+        # surface as NaN *or as finite garbage* (observed: 8e77 on an
+        # otherwise stationary iteration -- an isfinite() test waved it
+        # straight through). The only acceptance test that is actually
+        # correct is the RESIDUAL: keep the solver's answer only if it
+        # fits the equations at least as well as the warm start did.
+        # Breakdown happens precisely when the warm start already solves
+        # the system, so falling back to it loses nothing. Cost: one
+        # extra matvec per solve. `atol` gets a small absolute floor so
+        # the iteration can exit cleanly instead of grinding the
+        # recurrence into rounding noise.
+        atol_abs = im_tol * 1.0e-3
+
+        def _accept(matvec, bb, x, x_ref):
+            r_new = jnp.linalg.norm(matvec(x) - bb)
+            r_ref = jnp.linalg.norm(matvec(x_ref) - bb)
+            ok = jnp.isfinite(r_new) & (r_new <= r_ref)
+            return jnp.where(ok, x, x_ref)
+
+        def fwd(matvec, bb):
+            x, _ = bicgstab(matvec, bb, x0=x0, M=lambda y: y / diag,
+                            tol=im_tol, atol=atol_abs, maxiter=im_maxiter)
+            return _accept(matvec, bb, x, x0)
+
+        def tsp(vecmat, bb):
+            x0t = bb / diag                      # Jacobi guess
+            x, _ = bicgstab(vecmat, bb, x0=x0t, M=lambda y: y / diag,
+                            tol=im_tol, atol=atol_abs, maxiter=im_maxiter)
+            return _accept(vecmat, bb, x, x0t)
+
+        return jax.lax.custom_linear_solve(mv, b, solve=fwd,
+                                           transpose_solve=tsp)
+
+    def op_fluxes(x, D, vfr, vfz, wf, br=1.0, bz=1.0):
+        """Frozen-coefficient transport fluxes of the implicit operator:
+        the SAME stencil as `e_fluxes` (grad(DN) diffusion, donor-cell
+        drift at the frozen face velocity vfr/vfz, Eq. 36 thermal wall
+        with cell coefficient wf = coeff*v_th) MINUS the positivity
+        limiter, which is structurally unnecessary here (backward Euler
+        + upwinding is an M-matrix) and would break the charge ledger
+        against the solved densities. Linear in x by construction: the
+        upwind switch tests the frozen vfr/vfz, never x -- required by
+        `custom_linear_solve`."""
+        G = D * x
+        f = wf * x
+        Fr = tc.int_r * (-(padE(G) - padW(G)) / tc.dc_r
+                         + vfr * jnp.where(vfr > 0.0, padW(x), padE(x))) \
+            + br * (tc.wall_e * padW(f) - tc.wall_w * padE(f))
+        Fz = tc.int_z * (-(padN(G) - padS(G)) / tc.dc_z
+                         + vfz * jnp.where(vfz > 0.0, padS(x), padN(x))) \
+            + bz * (tc.wall_n * padS(f) - tc.wall_s * padN(f))
+        return Fr, Fz
+
+    def _at(b, which):
+        """Slice a face array to the cell-shaped east(1)/west(0) face."""
+        if isinstance(b, float):
+            return b
+        return b[1:, :] if which else b[:-1, :]
+
+    def _atz(b, which):
+        if isinstance(b, float):
+            return b
+        return b[:, 1:] if which else b[:, :-1]
+
+    def op_diag(D, vfr, vfz, wf, inv_dt, br=1.0, bz=1.0):
+        """Exact diagonal of (1/dt + L): the cell's own coefficient in
+        its outgoing flux through each face (interior D/dc + the
+        outgoing upwind half of |v|; thermal coefficient on wall
+        faces), for the Jacobi preconditioner of A and A^T alike."""
+        cE = tc.int_r[1:, :] * (D / tc.dc_r[1:, :]
+                                + jnp.maximum(vfr[1:, :], 0.0)) \
+            + tc.wall_e[1:, :] * wf * _at(br, 1)
+        cW = tc.int_r[:-1, :] * (D / tc.dc_r[:-1, :]
+                                 + jnp.maximum(-vfr[:-1, :], 0.0)) \
+            + tc.wall_w[:-1, :] * wf * _at(br, 0)
+        cN = tc.int_z[:, 1:] * (D / tc.dc_z[:, 1:]
+                                + jnp.maximum(vfz[:, 1:], 0.0)) \
+            + tc.wall_n[:, 1:] * wf * _atz(bz, 1)
+        cS = tc.int_z[:, :-1] * (D / tc.dc_z[:, :-1]
+                                 + jnp.maximum(-vfz[:, :-1], 0.0)) \
+            + tc.wall_s[:, :-1] * wf * _atz(bz, 0)
+        rate = (tc.area_r[1:, :] * cE + tc.area_r[:-1, :] * cW
+                + tc.area_z[:, 1:] * cN + tc.area_z[:, :-1] * cS) \
+            / tc.volume
+        return jnp.where(tc.active > 0.5, inv_dt + rate, 1.0)
+
+    def step_imp(ne, ni, n_eps, ss_r, ss_z, Phi, Ei_r, Ei_z,
+                 dt_e, dt_i, dt_eps, S_ext_eV):
+        shape = ne.shape
+        dte0 = jnp.broadcast_to(jnp.asarray(dt_e, jnp.float64), shape)
+        dti0 = jnp.broadcast_to(jnp.asarray(dt_i, jnp.float64), shape)
+        dtp0 = jnp.broadcast_to(jnp.asarray(dt_eps, jnp.float64), shape)
+
+        def body(_, st):
+            ne, ni, n_eps, ss_r, ss_z, Phi, Ei_r, Ei_z, dt_acc = st
+            ne_eff = jnp.maximum(ne, p.ne_floor)
+            Te = jnp.clip((2.0 / 3.0) * n_eps / ne_eff, p.Te_min, p.Te_max)
+            mu_e = mu_e_s * jnp.ones_like(ne)
+            vth_e = jnp.sqrt(8.0 * QE * Te / (jnp.pi * ME))
+            S = source_fn(ne, Te) if source_fn is not None \
+                else jnp.zeros_like(ne)
+
+            # ---- ONE common pseudo-clock -------------------------------- #
+            # Electron/energy transport rates no longer enter (implicit);
+            # kept: the caller's ceilings (chemistry / sink caps), the
+            # ion Courant clip at the current field, and the sheath-RC
+            # charging limit -- the latter concerns the coupled field-
+            # charge dynamics, not electron transport, and stays. All
+            # species and the energy equation share the same clock per
+            # cell (dt_e != dt_i pumps NET charge through the shared
+            # ionization source; dt_eps != dt_e gives Te spurious
+            # pseudo-dynamics -- see the explicit body's comments).
+            Er0, Ez0 = efield(Phi)
+            # field the IONS respond to: the Richards effective field on
+            # the "effective" path (lagged one substep -- it relaxes at
+            # the END of the substep toward the final field), the true
+            # field otherwise. Electrons always see the true field.
+            Eir_u = Ei_r if _eff else Er0
+            Eiz_u = Ei_z if _eff else Ez0
+            if courant_clip is not None:
+                dte = jnp.minimum(
+                    dte0,
+                    clip_dt(dti0, stab_rate(
+                        p.D_i * jnp.ones_like(ne),
+                        p.mu_i * jnp.ones_like(ne), Eir_u, Eiz_u)))
+                # sheath-RC charging limit (verbatim from the explicit
+                # body): one substep may change a wall face field by at
+                # most ~courant_clip x its current scale.
+                fe_c = cp * vth_e * ne
+                if ion_wall == "bohm":
+                    fi_c = jnp.maximum(0.25 * p.vth_i,
+                                       _uB(jnp.maximum(Te, p.Te_min))) * ni
+                else:
+                    fi_c = 0.25 * p.vth_i * ni
+                mi_ni = p.mu_i * ni
+                brq, bzq = sheath_r(Phi, Te), sheath_z(Phi, Te)
+                gw_r = brq * (tc.wall_e * jnp.abs(padW(fe_c) - padW(fi_c)
+                                                  - padW(mi_ni)
+                                                  * jnp.abs(Eir_u))
+                              + tc.wall_w * jnp.abs(padE(fe_c) - padE(fi_c)
+                                                    - padE(mi_ni)
+                                                    * jnp.abs(Eir_u)))
+                gw_z = bzq * (tc.wall_n * jnp.abs(padS(fe_c) - padS(fi_c)
+                                                  - padS(mi_ni)
+                                                  * jnp.abs(Eiz_u))
+                              + tc.wall_s * jnp.abs(padN(fe_c) - padN(fi_c)
+                                                    - padN(mi_ni)
+                                                    * jnp.abs(Eiz_u)))
+                Te_fr = jnp.maximum(padW(Te), padE(Te))
+                Te_fz = jnp.maximum(padS(Te), padN(Te))
+                es_r = jnp.maximum(jnp.abs(Er0), Te_fr / tc.dc_r)
+                es_z = jnp.maximum(jnp.abs(Ez0), Te_fz / tc.dc_z)
+                rq_r = QE * gw_r / (EPS0 * es_r)
+                rq_z = QE * gw_z / (EPS0 * es_z)
+                rate_q = jnp.maximum(
+                    jnp.maximum(rq_r[1:, :], rq_r[:-1, :]),
+                    jnp.maximum(rq_z[:, 1:], rq_z[:, :-1]))
+                dte = clip_dt(dte, rate_q)
+                dte = jnp.minimum(dte, dtp0)
+                # neighbour-ratio smoothing sweeps (verbatim): sharp
+                # per-cell dt gradients destabilize the coupled field-
+                # charge Jacobian even with implicit transport.
+                big = jnp.where(tc.active > 0.0, dte, jnp.inf)
+                for _s in range(14):
+                    nb = jnp.minimum(
+                        jnp.minimum(
+                            jnp.concatenate([big[:1, :], big[:-1, :]], 0),
+                            jnp.concatenate([big[1:, :], big[-1:, :]], 0)),
+                        jnp.minimum(
+                            jnp.concatenate([big[:, :1], big[:, :-1]], 1),
+                            jnp.concatenate([big[:, 1:], big[:, -1:]], 1)))
+                    big = jnp.minimum(big, 1.25 * nb)
+                dte = jnp.where(tc.active > 0.0, big, 0.0)
+            else:
+                dte = jnp.where(tc.active > 0.0,
+                                jnp.minimum(jnp.minimum(dte0, dti0), dtp0),
+                                0.0)
+            dt_fr = jnp.maximum(padW(dte), padE(dte))
+            dt_fz = jnp.maximum(padS(dte), padN(dte))
+            inv_dt = 1.0 / jnp.where(dte > 0.0, dte, 1.0)
+
+            # ---- substep-entry (frozen) sources: S(n^t, Te^t) ----------- #
+            if evolve_energy:
+                S_stat = S_ext_eV \
+                    - 3.0 * p.mass_ratio * nu_m * ne * (Te - p.Tg_eV)
+                if inelastic_fn is not None:
+                    S_stat = S_stat - inelastic_fn(ne, Te)
+
+            # ---- Gummel block sweeps (static trip count) ---------------- #
+            ne_g, neps_g, Phi_g = ne, n_eps, Phi
+            for _k in range(max(int(n_gummel), 1)):
+                # coefficient refresh between sweeps (sweep 0 == entry)
+                Te_g = jnp.clip((2.0 / 3.0) * neps_g
+                                / jnp.maximum(ne_g, p.ne_floor),
+                                p.Te_min, p.Te_max)
+                vth_g = jnp.sqrt(8.0 * QE * Te_g / (jnp.pi * ME))
+                D_g = mu_e * Te_g
+                wf_e = cp * vth_g
+                # frozen for this sweep -> the operator stays LINEAR in x
+                br_g = sheath_r(Phi_g, Te_g)
+                bz_g = sheath_z(Phi_g, Te_g)
+
+                # (a) P2 Poisson at the latest solved electron density;
+                # its drift response to the potential update is the
+                # (unchanged) electron augmentation, cancelled at a
+                # stationary point by the delta form.
+                Er_g, Ez_g = efield(Phi_g)
+                Fr_i, Fz_i = i_fluxes(ni,
+                                      Eir_u if _eff else Er_g,
+                                      Eiz_u if _eff else Ez_g,
+                                      dte, Te_g)
+                ni_p = ni + dte * (-div(Fr_i, Fz_i) + S)
+                vfr = -0.5 * (padW(mu_e) + padE(mu_e)) * Er_g
+                vfz = -0.5 * (padS(mu_e) + padN(mu_e)) * Ez_g
+                Fr_e, Fz_e = op_fluxes(ne_g, D_g, vfr, vfz, wf_e,
+                                       br_g, bz_g)
+                ssr_p = ss_r + dt_fr * (QE * (pc.scW_r - pc.scE_r) * Fr_e
+                                        + QE * (pc.scE_r - pc.scW_r) * Fr_i)
+                ssz_p = ss_z + dt_fz * (QE * (pc.scS_z - pc.scN_z) * Fz_e
+                                        + QE * (pc.scN_z - pc.scS_z) * Fz_i)
+                gaug_r, gaug_z = aug(mu_e * ne_g, p.mu_i * ni,
+                                     dt_fr, dt_fz, dt_fr, dt_fz)
+                rhs = pc.plasma * QE * (ni_p - ne_g) * pc.volume \
+                    + rhs_surface(ssr_p, ssz_p) \
+                    + aug_matvec(Phi_g, gaug_r, gaug_z)
+                Phi_g = psolve(pc, rhs, gaug_r, gaug_z, Phi_g)
+
+                # (b) backward-Euler electron continuity at the NEW
+                # field; coefficients frozen -> linear system.
+                Er_g, Ez_g = efield(Phi_g)
+                vfr = -0.5 * (padW(mu_e) + padE(mu_e)) * Er_g
+                vfz = -0.5 * (padS(mu_e) + padN(mu_e)) * Ez_g
+
+                def mv_e(x, D_g=D_g, vfr=vfr, vfz=vfz, wf_e=wf_e,
+                         inv_dt=inv_dt):
+                    Fr, Fz = op_fluxes(x, D_g, vfr, vfz, wf_e,
+                                       br_g, bz_g)
+                    return jnp.where(tc.active > 0.5,
+                                     inv_dt * x + div(Fr, Fz), x)
+
+                b_e = tc.active * (inv_dt * ne + S)
+                ne_g = imsolve(mv_e, b_e, ne_g,
+                               op_diag(D_g, vfr, vfz, wf_e, inv_dt,
+                                       br_g, bz_g))
+
+                if evolve_energy:
+                    # (c) backward-Euler energy at the SAME field:
+                    # D_eps = (5/3) mu_e Te, mu_eps = (5/3) mu_e, the
+                    # Eq. 36 energy wall coefficient (5/6)(1-re)/(1+re);
+                    # ES Joule from INTERIOR faces only (explicit-body
+                    # caveat), entry ne, sweep field.
+                    Erc = 0.5 * (tc.int_r[:-1, :] * Er_g[:-1, :]
+                                 + tc.int_r[1:, :] * Er_g[1:, :])
+                    Ezc = 0.5 * (tc.int_z[:, :-1] * Ez_g[:, :-1]
+                                 + tc.int_z[:, 1:] * Ez_g[:, 1:])
+                    Fre_s, Fze_s = op_fluxes(ne_g, D_g, vfr, vfz, wf_e,
+                                             br_g, bz_g)
+                    S_eps = S_stat + es_heating(ne, mu_e, Erc, Ezc,
+                                                Fre_s, Fze_s)
+                    wf_p = ce * vth_g
+
+                    def mv_p(x, D_g=D_g, vfr=vfr, vfz=vfz, wf_p=wf_p,
+                             inv_dt=inv_dt):
+                        Fr, Fz = op_fluxes(x, c53 * D_g, c53 * vfr,
+                                           c53 * vfz, wf_p, br_g, bz_g)
+                        return jnp.where(tc.active > 0.5,
+                                         inv_dt * x + div(Fr, Fz), x)
+
+                    b_p = tc.active * (inv_dt * n_eps + S_eps)
+                    neps_g = imsolve(mv_p, b_p, neps_g,
+                                     op_diag(c53 * D_g, c53 * vfr,
+                                             c53 * vfz, wf_p, inv_dt,
+                                             br_g, bz_g))
+
+            # ---- final updates: exact discrete charge ledger ------------ #
+            # sigma_s MUST be charged from the same fluxes that produced
+            # the solved densities: the electron fluxes are the operator
+            # fluxes reconstructed at (ne_g; final-sweep field and
+            # coefficients) -- by the linear system these satisfy
+            # (ne_g - ne)/dt = -div F(ne_g) + S to solver tolerance, so
+            # any other flux (e.g. a limited one, or one at refreshed
+            # coefficients) leaks charge against the wall ledger. The
+            # ion update stays explicit at the final field with its
+            # limiter; its charging uses those same limited fluxes.
+            Fr_e, Fz_e = op_fluxes(ne_g, D_g, vfr, vfz, wf_e, br_g, bz_g)
+            Fr_i, Fz_i = i_fluxes(ni,
+                                  Eir_u if _eff else Er_g,
+                                  Eiz_u if _eff else Ez_g,
+                                  dte, Te_g)
+            # the max(., 0) guards mirror the explicit path; for the
+            # Table 2 argon set S >= 0 and the M-matrix solve keeps
+            # ne_g, neps_g nonnegative, so they are no-ops here.
+            ne = jnp.maximum(ne_g, 0.0)
+            ni = jnp.maximum(ni + dte * (-div(Fr_i, Fz_i) + S), 0.0)
+            if evolve_energy:
+                n_eps = jnp.maximum(neps_g, 0.0)
+            ss_r = ss_r + dt_fr * (QE * (pc.scW_r - pc.scE_r) * Fr_e
+                                   + QE * (pc.scE_r - pc.scW_r) * Fr_i)
+            ss_z = ss_z + dt_fz * (QE * (pc.scS_z - pc.scN_z) * Fz_e
+                                   + QE * (pc.scN_z - pc.scS_z) * Fz_i)
+            if _eff:
+                # Richards relaxation toward the END-of-substep field,
+                # exact exponential update of dE/dt = nu_i (E - E_eff)
+                # over the face-local dt (unconditionally stable, exact
+                # for the linear ODE regardless of nu_i * dt).
+                fr = jnp.exp(-_NU_I * dt_fr)
+                fz = jnp.exp(-_NU_I * dt_fz)
+                Ei_r = Er_g + (Ei_r - Er_g) * fr
+                Ei_z = Ez_g + (Ei_z - Ez_g) * fz
+            dt_acc = dt_acc + jnp.sum(dte * tc.active) \
+                / jnp.maximum(jnp.sum(tc.active), 1.0)
+            return ne, ni, n_eps, ss_r, ss_z, Phi_g, Ei_r, Ei_z, dt_acc
+
+        return jax.lax.fori_loop(0, n_sub, body,
+                                 (ne, ni, n_eps, ss_r, ss_z, Phi,
+                                  Ei_r, Ei_z, 0.0))
+
+    return jax.jit(step_imp)
