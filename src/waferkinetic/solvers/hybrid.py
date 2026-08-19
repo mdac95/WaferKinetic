@@ -235,6 +235,9 @@ class HybridNumerics:
     n_sub_ars: int = 200
     # local pseudo-time (transport.local_dt machinery)
     cfl: float = 0.4
+    uniform_dt: bool = False          # collapse the per-cell pseudo-clock
+                                      # to one global minimum (control
+                                      # experiment; see `_local_dts`)
     courant_clip: float = 0.4         # FKPM in-loop re-clip (poisson.py)
     dt_eps_max: float = 3.0e-9        # stiff-inelastic guard (proven in
                                       # test_electron_energy test 3)
@@ -248,16 +251,111 @@ class HybridNumerics:
     delta_min: float = -0.25
     delta_max: float = 0.50           # > |delta_min|: the gamma_a asymmetry
     accel_start: int = 3              # let the seed transient set a history
+    # Eq. 56 extrapolation is suppressed while the power ramps, so its
+    # FIRST application would otherwise land at full delta_max on a
+    # state that has never been accelerated. With xi=100 and a natural
+    # rel of ~2%/iteration the clamp saturates, giving a 50% jump in one
+    # step -- observed to blow the solve up on the iteration after the
+    # ramp completed. Ramp delta_max geometrically from delta_max0 to
+    # delta_max over this many iterations once acceleration first arms.
+    # Eq. 56 extrapolates species assumed to be SLOW and near
+    # equilibrium. During ignition Ar* is the fastest-growing variable
+    # and sits in a stepwise-ionization feedback loop (Ar* -> stepwise
+    # ionization -> ne -> Ar*), so extrapolating it amplifies a runaway
+    # at ANY clamp size -- observed to diverge even at delta_max = 0.026.
+    # Set False to run the pseudo-transient straight through; it costs
+    # iterations but each one is cheap.
+    use_accel: bool = True
+    accel_warmup: int = 12
+    delta_max0: float = 0.02
     accel_off_rel: float = 3.0e-4     # natural rel change disabling accel
     min_unaccel: int = 10             # final unaccelerated iterations (12.4)
     # convergence
     tol: float = 1.0e-5
     n_consecutive: int = 3
     max_outer: int = 400
+    # ---- ignition power ramp (doc Sec. 5.5 transient) ------------------- #
+    # At the seed the plasma physically CANNOT absorb P_set: inelastic
+    # losses go as ne*ng*k(Te), which at ne_seed is orders below the
+    # deposition, so Te has no equilibrium and runs to the Te_max clamp
+    # until ionization has grown ne. The clamp is the model reporting
+    # that correctly, but a solution parked on it is badly conditioned
+    # AND carries no gradient (d/dn_eps of a clipped Te is identically
+    # zero), which matters for a differentiable solver. Ramping the
+    # deposited power keeps the discharge on its own power balance the
+    # whole way in. The pseudo-transient is not time-accurate anyway
+    # (per-cell dt), so this costs nothing physical -- the fixed point
+    # at full power is unchanged. P_ramp_iters = 0 disables the ramp.
+    P_ramp_iters: int = 0             # ramp steps to reach P_set_W
+    P_ramp_frac0: float = 0.05        # deposited fraction on step 1
+    # Gate the ramp on the RESIDUAL instead of on iteration count: a ramp
+    # step is taken only once the relative change has fallen below this,
+    # i.e. the discharge has settled at the present power. This is
+    # parameter continuation and it self-adapts -- slow through
+    # sustainment, fast where the solution is stiffly determined.
+    # Ramping in pseudo-TIME is not an option: one FKPM slice advances
+    # ~1e-8 s at the ion-limited clock, so a 100 us ramp would take
+    # ~1e4 outer iterations to reach full power, and once Eq. 56
+    # acceleration is on the accumulated pseudo-time has no physical
+    # meaning anyway. None = advance one step per iteration.
+    P_ramp_gate_rel: float | None = None
     # linear solvers
     emm_tol: float = 1.0e-9
     cg_tol: float = 1.0e-8
     use_direct_emm: bool = False      # scipy SuperLU instead of jitted BiCGStab
+    # P3 implicit electron transport (poisson.py `implicit_electrons`):
+    # backward-Euler electron continuity + energy inside the FKPM slice.
+    # Defaults reproduce the explicit path bit-for-bit when off; when on,
+    # the electron/energy transport rates leave the pseudo-clock (see
+    # `_local_dts`) and the remaining limit is ion sheath drift
+    # (~0.1-1 ns on 0.3 mm cells) plus the retained sheath-RC and
+    # chemical caps.
+    # Electrostatic Joule form in the electron energy equation:
+    # "drift" (doc Eq. 12, the spec) or "flux" (-Gamma_e . E_S, the work
+    # on the actual electron flux). See poisson.es_heating; "flux"
+    # DEPARTS FROM THE MODEL DOCUMENT and is provided to quantify how
+    # much of P_es is the missing drift/diffusion cancellation.
+    es_joule: str = "drift"
+    # Electron wall flux: "thermal" is doc Eq. 36 (one-sided thermal, no
+    # Phi dependence -- correct only on a sheath-resolving mesh);
+    # "sheath" multiplies it by exp(-(Phi_p - Phi_w)/Te), the Boltzmann
+    # factor of the unresolved sheath. See poisson.sheath_r. "sheath"
+    # DEPARTS FROM THE MODEL DOCUMENT. It must be applied at every site
+    # at once -- particle flux, energy flux, the RC clip and the ledger
+    # -- which is what threading this flag does.
+    wall_flux: str = "thermal"
+    # Ion wall flux: "thermal" is doc Eq. 37 (0.25 vth_i at T_i = T_g +
+    # gated drift); "bohm" floors the wall coefficient at the Bohm speed
+    # u_B = sqrt(q Te / M) -- the sheath-edge criterion drift-diffusion
+    # ions cannot satisfy on their own (no presheath acceleration in the
+    # momentum-free closure). Predicted effect: wafer sheath drop falls
+    # from the measured 6.5 Te toward ~5 Te, Phi_pk ~32 -> ~22 V.
+    # DEPARTS FROM THE MODEL DOCUMENT (Eq. 37).
+    ion_wall: str = "thermal"
+    # Ion drift field: "static" uses E_S directly (doc Eq. 23);
+    # "effective" uses the Richards relaxation dE_eff/dt = nu_i(E_S -
+    # E_eff) (doc Sec. 5.1 option 2 closing remark; Economou tutorial
+    # Eq. 6; Richards, Thompson & Sawin APL 50, 492 (1987)) so ions
+    # cannot respond to field structure faster than their momentum
+    # relaxation. Requires implicit_electrons=True. This is the
+    # inertia proxy the Eremin benchmark identifies as what closes the
+    # ~2x fluid density overestimate -- field-dependent mobility alone
+    # did not.
+    ion_field: str = "static"
+    # The standalone EETM relaxation (outer_iteration step 2) advances
+    # n_eps at frozen ne for n_sub_eetm substeps before the FKPM slice,
+    # which sub-slices the SAME equation internally. It is redundant,
+    # it computes its dt once with no in-loop re-clip, and any mismatch
+    # between its source terms and the FKPM's is an uncounted source in
+    # the loop. Set False to drop it and let the FKPM own the energy.
+    eetm_slice: bool = True
+    implicit_electrons: bool = False
+    n_gummel: int = 2                 # Gummel sweeps per FKPM substep
+    implicit_tol: float = 1.0e-9      # BiCGStab tol of the implicit solves
+    implicit_maxiter: int = 2000
+    dt_imp_max: float | None = None   # optional absolute clock ceiling (s)
+    dt_eps_max_imp: float | None = None  # implicit-path stand-in for
+                                      # dt_eps_max (None: dt_sink governs)
 
 
 @dataclass
@@ -347,6 +445,11 @@ class HybridState:
     ne_emm: np.ndarray
     ni_prev: np.ndarray
     ars_prev: np.ndarray
+    # Richards effective field the ions drift in (ion_field="effective");
+    # face arrays, zero-initialized -- they relax toward E_S at
+    # nu_i = q/(M mu_i) inside the FKPM stepper. None on the static path.
+    Ei_r: np.ndarray | None = None    # (Nr+1, Nz)
+    Ei_z: np.ndarray | None = None    # (Nr, Nz+1)
 
 
 def seed_state(setup: HybridSetup) -> HybridState:
@@ -472,10 +575,15 @@ class HybridDrivers:
             self._tc, self._pc, setup.fkpm_params,
             source_fn=source_fn, inelastic_fn=inelastic_fn,
             evolve_energy=True, n_sub=self.num.n_sub_fkpm,
-            cg_tol=self.num.cg_tol, courant_clip=self.num.courant_clip)
+            cg_tol=self.num.cg_tol, courant_clip=self.num.courant_clip,
+            es_joule=self.num.es_joule, wall_flux=self.num.wall_flux,
+            ion_wall=self.num.ion_wall, ion_field=self.num.ion_field,
+            implicit_electrons=self.num.implicit_electrons,
+            n_gummel=self.num.n_gummel, im_tol=self.num.implicit_tol,
+            im_maxiter=self.num.implicit_maxiter)
         self._eetm = electron_energy.make_jax_energy_stepper(
             self._tc, setup.eparams, inelastic_fn=inelastic_fn,
-            n_sub=self.num.n_sub_eetm)
+            n_sub=self.num.n_sub_eetm, es_joule=self.num.es_joule)
         self._ars_ref = n_ars.copy()
         self.n_chem_bakes += 1
         return True
@@ -505,15 +613,40 @@ class HybridDrivers:
             jnp.asarray(n_eps), jnp.asarray(ne), jnp.asarray(Er),
             jnp.asarray(Ez), jnp.asarray(S_ext_eV), jnp.asarray(dt)))
 
+    #: pseudo-time actually advanced by the last FKPM slice (s), summed
+    #: over substeps from the in-loop clock -- NOT the input ceilings
+    last_slice_advance: float = 0.0
+
+    #: effective-field arrays returned by the last implicit fkpm_step
+    #: (None on the static/explicit paths); consumed by outer_iteration
+    last_Ei: tuple | None = None
+
     def fkpm_step(self, state: HybridState, dt_e, dt_i, dt_eps, S_ext_eV):
         jnp = self._jnp
+        if self.num.implicit_electrons:
+            Eir = state.Ei_r if state.Ei_r is not None \
+                else np.zeros_like(state.ss_r)
+            Eiz = state.Ei_z if state.Ei_z is not None \
+                else np.zeros_like(state.ss_z)
+            out = self._fkpm(
+                jnp.asarray(state.ne), jnp.asarray(state.ni),
+                jnp.asarray(state.n_eps), jnp.asarray(state.ss_r),
+                jnp.asarray(state.ss_z), jnp.asarray(state.Phi),
+                jnp.asarray(Eir), jnp.asarray(Eiz),
+                jnp.asarray(dt_e), jnp.asarray(dt_i), jnp.asarray(dt_eps),
+                jnp.asarray(S_ext_eV))
+            self.last_slice_advance = float(out[-1])
+            self.last_Ei = (np.asarray(out[6]), np.asarray(out[7]))
+            return tuple(np.asarray(a) for a in out[:6])
         out = self._fkpm(
             jnp.asarray(state.ne), jnp.asarray(state.ni),
             jnp.asarray(state.n_eps), jnp.asarray(state.ss_r),
             jnp.asarray(state.ss_z), jnp.asarray(state.Phi),
             jnp.asarray(dt_e), jnp.asarray(dt_i), jnp.asarray(dt_eps),
             jnp.asarray(S_ext_eV))
-        return tuple(np.asarray(a) for a in out)
+        self.last_slice_advance = float(out[-1])
+        self.last_Ei = None
+        return tuple(np.asarray(a) for a in out[:-1])
 
     def ars_step(self, n_ars, ne, Te, ni, dt) -> np.ndarray:
         jnp = self._jnp
@@ -548,17 +681,30 @@ def _local_dts(setup: HybridSetup, num: HybridNumerics, state: HybridState,
     nu_iz = k_iz * n_Ar + k_step * state.n_ars           # per-electron growth
     dt_chem = num.chem_safety / np.maximum(nu_iz, tiny)
 
-    dt_e = transport.local_dt(top, mu_e * Te, mu_e, -1.0, Er, Ez,
-                              cfl=num.cfl)
-    dt_e = np.where(top.active, np.minimum(dt_e, dt_chem), 0.0)
+    if num.implicit_electrons:
+        # P3: electron drift-diffusion is solved backward-Euler inside
+        # the FKPM, so it no longer bounds the clock -- only the
+        # chemical stiffness cap remains as a ceiling (sources stay
+        # explicit). The in-loop ion Courant re-clip and the sheath-RC
+        # charging limit (coupled field-charge dynamics, NOT redundant
+        # with implicit transport) still apply inside the stepper.
+        dt_e = np.where(top.active, dt_chem, 0.0)
+    else:
+        dt_e = transport.local_dt(top, mu_e * Te, mu_e, -1.0, Er, Ez,
+                                  cfl=num.cfl)
+        dt_e = np.where(top.active, np.minimum(dt_e, dt_chem), 0.0)
 
-    dt_i = transport.local_dt(top, p.D_i, p.mu_i, +1.0, Er, Ez, cfl=num.cfl)
+    if num.ion_field == "effective" and state.Ei_r is not None:
+        # the ion Courant ceiling must bound the field the ions actually
+        # drift in, and the effective field is far smaller in the sheath
+        Er_i = state.Ei_r
+        Ez_i = state.Ei_z
+    else:
+        Er_i, Ez_i = Er, Ez
+    dt_i = transport.local_dt(top, p.D_i, p.mu_i, +1.0, Er_i, Ez_i,
+                              cfl=num.cfl)
     dt_i = np.where(top.active, np.minimum(dt_i, dt_chem), 0.0)
 
-    dt_eps = electron_energy.energy_local_dt(top, state.ne, state.n_eps,
-                                             Er, Ez, setup.eparams,
-                                             cfl=num.cfl,
-                                             dt_max=num.dt_eps_max)
     # energy-sink stiffness: never drain more than chem_safety of n_eps
     n = (state.ne, n_Ar, state.n_ars, state.ni)
     L = np.maximum(setup.chem.electron_energy_loss(n, Te), 0.0) \
@@ -566,7 +712,45 @@ def _local_dts(setup: HybridSetup, num: HybridNumerics, state: HybridState,
                      * (Te - case.Tg_eV), 0.0)
     dt_sink = num.chem_safety * np.maximum(state.n_eps, 0.0) \
         / np.maximum(L, tiny)
-    dt_eps = np.where(top.active, np.minimum(dt_eps, dt_sink), 0.0)
+    if num.implicit_electrons:
+        # P3: no explicit energy-transport bound. dt_sink alone is NOT a
+        # usable cap -- where the net loss L is small it returns
+        # arbitrarily large values (observed ~1e42 s), so it is capped by
+        # the same explicit-source chemical timescale that bounds dt_e.
+        dt_eps = np.minimum(dt_sink, dt_chem)
+        if num.dt_eps_max_imp is not None:
+            dt_eps = np.minimum(dt_eps, num.dt_eps_max_imp)
+        dt_eps = np.where(top.active, dt_eps, 0.0)
+    else:
+        dt_eps = electron_energy.energy_local_dt(top, state.ne,
+                                                 state.n_eps,
+                                                 Er, Ez, setup.eparams,
+                                                 cfl=num.cfl,
+                                                 dt_max=num.dt_eps_max)
+        dt_eps = np.where(top.active, np.minimum(dt_eps, dt_sink), 0.0)
+    if num.implicit_electrons and num.dt_imp_max is not None:
+        dt_e = np.minimum(dt_e, num.dt_imp_max)
+        dt_i = np.minimum(dt_i, num.dt_imp_max)
+        dt_eps = np.minimum(dt_eps, num.dt_imp_max)
+    if num.uniform_dt:
+        # Control experiment. Local time stepping converges to the same
+        # fixed point (dt multiplies a residual that vanishes there),
+        # but it is NOT conservative in transit: a face flux F between
+        # cells A and B removes dt_A*A_f*F from one and deposits
+        # dt_B*A_f*F in the other, so while dt_A != dt_B the scheme
+        # creates charge at a rate proportional to (dt_A - dt_B)*F.
+        # In a neutral-transport problem that is harmless bookkeeping;
+        # here the created charge enters Poisson and produces a
+        # potential, so it can inflate Phi and the ES Joule term during
+        # the approach. Setting this collapses the clock to a single
+        # global minimum, which is fully conservative and much slower --
+        # if a pathology survives it, local time stepping is not the
+        # cause.
+        act = top.active
+        if act.any():
+            dt_e = np.where(act, dt_e[act].min(), 0.0)
+            dt_i = np.where(act, dt_i[act].min(), 0.0)
+            dt_eps = np.where(act, dt_eps[act].min(), 0.0)
     return dt_e, dt_i, dt_eps
 
 
@@ -591,7 +775,8 @@ def _ars_dt(setup: HybridSetup, num: HybridNumerics, state: HybridState,
 # ----------------------------------------------------------------------------
 
 def power_ledger(setup: HybridSetup, state: HybridState,
-                 Q: np.ndarray) -> dict:
+                 Q: np.ndarray, es_joule: str = "drift",
+                 wall_flux: str = "thermal") -> dict:
     """Global power ledger, mirroring the FKPM stepper's discretization
     term by term (same Te clamps, same interior-face-restricted ES Joule
     field, same wall coefficients) so the residual measures convergence,
@@ -609,7 +794,8 @@ def power_ledger(setup: HybridSetup, state: HybridState,
 
     P_in = float(np.sum(Q * V * act))
     P_wall = electron_energy.wall_energy_power(
-        top, np.where(act, state.n_eps, 0.0), Te, setup.eparams)
+        top, np.where(act, state.n_eps, 0.0), Te, setup.eparams,
+        Phi=state.Phi, wall_flux=wall_flux)
     P_el = QE * float(np.sum(3.0 * case.mass_ratio * case.nu_m * state.ne
                              * (Te - case.Tg_eV) * V * act))
 
@@ -632,8 +818,17 @@ def power_ledger(setup: HybridSetup, state: HybridState,
     Erc = 0.5 * (ir[:-1, :] * Er[:-1, :] + ir[1:, :] * Er[1:, :])
     Ezc = 0.5 * (iz[:, :-1] * Ez[:, :-1] + iz[:, 1:] * Ez[:, 1:])
     mu_e = QE / (ME * case.nu_m)
-    P_es = QE * float(np.sum(state.ne * mu_e * (Erc ** 2 + Ezc ** 2)
-                             * V * act))
+    if es_joule == "drift":
+        S_es = state.ne * mu_e * (Erc ** 2 + Ezc ** 2)
+    else:
+        # -Gamma_e . E_S from the same discrete fluxes the stepper uses
+        Fr_e, Fz_e = transport.flux_drift_diffusion(
+            top, state.ne, mu_e * Te, mu_e * np.ones_like(state.ne),
+            -1.0, Er, Ez)
+        Frc = 0.5 * (ir[:-1, :] * Fr_e[:-1, :] + ir[1:, :] * Fr_e[1:, :])
+        Fzc = 0.5 * (iz[:, :-1] * Fz_e[:, :-1] + iz[:, 1:] * Fz_e[:, 1:])
+        S_es = -(Frc * Erc + Fzc * Ezc)
+    P_es = QE * float(np.sum(S_es * V * act))
 
     resid = P_in + P_es - (P_wall + P_el + P_inel)
     P_ars_wall = chemistry.EPS_EXC * QE * neutrals.wall_loss_rate(
@@ -683,7 +878,8 @@ def collisional_skin_depth(ne_peak: float, nu_m: float,
 # ----------------------------------------------------------------------------
 
 def accelerate(setup: HybridSetup, num: HybridNumerics,
-               state: HybridState) -> HybridState:
+               state: HybridState,
+               delta_max: float | None = None) -> HybridState:
     """Bounded linear extrapolation of the slow densities (Ar*, Ar+)
     with clamped fractional change; charge density preserved by
     adjusting ne; n_eps rescaled with ne to preserve Te."""
@@ -691,7 +887,8 @@ def accelerate(setup: HybridSetup, num: HybridNumerics,
 
     def extrap(N, N_prev):
         rel = (N - N_prev) / np.maximum(N, 1.0)
-        delta = np.clip(num.xi * rel, num.delta_min, num.delta_max)
+        dmax = num.delta_max if delta_max is None else delta_max
+        delta = np.clip(num.xi * rel, num.delta_min, dmax)
         return np.where(act, N * (1.0 + delta), N)
 
     ni_a = extrap(state.ni, state.ni_prev)
@@ -709,9 +906,25 @@ def accelerate(setup: HybridSetup, num: HybridNumerics,
 # One outer iteration (doc Sec. 12.3 sequencing)
 # ----------------------------------------------------------------------------
 
+def ramp_fraction(num: HybridNumerics, it: int | None) -> float:
+    """Fraction of `P_set_W` deposited on outer iteration `it`
+    (1-based). Geometric from `P_ramp_frac0` to 1.0 over
+    `P_ramp_iters` iterations -- geometric rather than linear because
+    the sustainment threshold is a lower bound on power, so the early
+    steps must be finely spaced in the decade above it. Returns 1.0
+    when the ramp is disabled or finished."""
+    N = int(num.P_ramp_iters)
+    if N <= 0 or it is None or it >= N:
+        return 1.0
+    f0 = float(num.P_ramp_frac0)
+    if not 0.0 < f0 <= 1.0:
+        raise ValueError("P_ramp_frac0 must lie in (0, 1]")
+    return f0 ** (1.0 - (it - 1) / max(N - 1, 1))
+
+
 def outer_iteration(setup: HybridSetup, num: HybridNumerics,
-                    drv: HybridDrivers, state: HybridState
-                    ) -> tuple[HybridState, dict]:
+                    drv: HybridDrivers, state: HybridState,
+                    it: int | None = None) -> tuple[HybridState, dict]:
     """EMM (power-controlled) -> chem refresh check -> EETM relaxation
     -> FKPM(+EETM sub-sliced) slice -> Ar* slice. Returns the new state
     (pre-acceleration) and a diagnostics dict including the ledger."""
@@ -726,11 +939,13 @@ def outer_iteration(setup: HybridSetup, num: HybridNumerics,
         emm_refreshed = True
     Q = inductive.power_deposition(state.A, sigma, case.omega)
     P_dep = float(np.sum(Q * setup.top.volume * setup.top.active))
+    frac = ramp_fraction(num, it)
+    P_target = case.P_set_W * frac
     if not P_dep > 0.0:
         raise RuntimeError("EMM deposited no power in the plasma; the seed "
                            "may be below the sustainment floor (doc Sec. "
                            "5.5: under-seeding fails to sustain).")
-    s2 = case.P_set_W / P_dep
+    s2 = P_target / P_dep
     state = replace(state, A=state.A * np.sqrt(s2),
                     I_coil=state.I_coil * float(np.sqrt(s2)))
     Q = Q * s2                                     # integrates to P_set exactly
@@ -742,12 +957,23 @@ def outer_iteration(setup: HybridSetup, num: HybridNumerics,
     # ---- 2. EETM relaxation at frozen ne (Sec. 12.3 step 3) ------------- #
     Er, Ez = setup.pop.efield(state.Phi)
     Te = electron_energy.temperature(state.ne, state.n_eps, setup.eparams)
-    dt_eps0 = electron_energy.energy_local_dt(setup.top, state.ne,
-                                              state.n_eps, Er, Ez,
-                                              setup.eparams, cfl=num.cfl,
-                                              dt_max=num.dt_eps_max)
-    n_eps = drv.eetm_step(state.n_eps, state.ne, Er, Ez, S_ext, dt_eps0)
-    state = replace(state, n_eps=n_eps)
+    # The standalone slice computes its dt ONCE at entry Te and runs 200
+    # substeps with no in-loop re-clip, while `make_jax_energy_stepper`
+    # clamps Te at Te_max internally -- so D_eps = (5/3) mu_e Te can rise
+    # by Te_max/Te_entry after the dt is fixed. At the seed
+    # (Te_entry = 2/3 * eps_seed = 2.67 eV) that is 5.6x, i.e. an
+    # effective CFL of 2.25: the slice diverges, n_eps runs away in the
+    # wall cells, and the runaway hides behind the Te clamp (Te_pk reads
+    # a healthy Te_max while P_wall reaches ~1e52 W). Te_ref = Te_max
+    # bounds D_eps by the same clamp the stepper enforces, which is the
+    # only self-consistent choice. This is NOT gated on the implicit
+    # path: the explicit path has the identical defect.
+    dt_eps0 = electron_energy.energy_local_dt(
+        setup.top, state.ne, state.n_eps, Er, Ez, setup.eparams,
+        cfl=num.cfl, dt_max=num.dt_eps_max, Te_ref=case.Te_max)
+    if num.eetm_slice:
+        n_eps = drv.eetm_step(state.n_eps, state.ne, Er, Ez, S_ext, dt_eps0)
+        state = replace(state, n_eps=n_eps)
 
     # ---- 3. FKPM slice, EETM sub-sliced inside (Sec. 12.3 step 4) ------- #
     Te = electron_energy.temperature(state.ne, state.n_eps, setup.eparams)
@@ -756,6 +982,8 @@ def outer_iteration(setup: HybridSetup, num: HybridNumerics,
                                                    dt_eps, S_ext)
     state = replace(state, ne=ne, ni=ni, n_eps=n_eps,
                     ss_r=ss_r, ss_z=ss_z, Phi=Phi)
+    if drv.last_Ei is not None:
+        state = replace(state, Ei_r=drv.last_Ei[0], Ei_z=drv.last_Ei[1])
 
     # ---- 4. Ar* slice at frozen (ne, Te, Ar+) --------------------------- #
     Te = electron_energy.temperature(state.ne, state.n_eps, setup.eparams)
@@ -764,16 +992,75 @@ def outer_iteration(setup: HybridSetup, num: HybridNumerics,
     state = replace(state, n_ars=n_ars)
 
     # ---- diagnostics ----------------------------------------------------- #
-    ledger = power_ledger(setup, state, Q)
+    ledger = power_ledger(setup, state, Q, es_joule=num.es_joule,
+                          wall_flux=num.wall_flux)
     pen, _ = field_penetration_depth(setup, Q)
     act = setup.top.active
+    # UNCLIPPED mean energy. `temperature()` clamps at Te_max, so a
+    # runaway in n_eps is invisible in Te_pk: the reported Te can sit at
+    # a healthy 15 eV while eps_bar is in the hundreds. Always read this
+    # alongside Te_pk, together with the fraction of the plasma pinned
+    # on the clamp (a solution parked there also carries no gradient).
+    # --- charge bookkeeping -------------------------------------------- #
+    # Phi is set by tiny departures from quasineutrality, so a potential
+    # that stops tracking Te and starts tracking deposited power means
+    # charge is ACCUMULATING somewhere. These two numbers say where:
+    #   qn_dev   bulk charge imbalance |ni - ne| / ne
+    #   ss_tot   net charge on dielectric surfaces (C). At steady state
+    #            the net current to a floating dielectric must vanish,
+    #            so ss_tot must plateau; a linear ramp in ss_tot
+    #            alongside a linear ramp in Phi is the signature of a
+    #            surface-charge balance that never closes.
+    pop = setup.pop
+    ne_ref = max(float(state.ne[act].max()), 1.0) if act.any() else 1.0
+    qn_dev = (float(np.abs(state.ni - state.ne)[act].max()) / ne_ref
+              if act.any() else np.nan)
+    ss_tot = float(
+        np.sum(0.5 * (pop.scE_r + pop.scW_r) * state.ss_r * pop.area_r)
+        + np.sum(0.5 * (pop.scN_z + pop.scS_z) * state.ss_z * pop.area_z))
+    eps_bar = np.where(act, state.n_eps / np.maximum(state.ne,
+                                                     case.ne_floor), 0.0)
+    n_act = max(int(act.sum()), 1)
+    clamped = float(np.sum(act & (eps_bar > 1.5 * case.Te_max))) / n_act
+    # Cells whose energy density has been driven to the floor. The
+    # steppers apply max(n_eps, 0) after each substep, so wherever the
+    # Eq. 36 energy wall flux would remove more than the cell holds the
+    # loss is silently truncated -- the ledger's P_wall then charges the
+    # full analytic rate while the solver only ever paid part of it,
+    # which shows up as a persistent imbalance at an otherwise steady
+    # state. A nonzero value here means the ledger is over-counting.
+    floored = float(np.sum(act & (eps_bar < 1.5 * case.Te_min))) / n_act
     diag = dict(
         ledger=ledger, Q=Q, Te=Te,
         ne_pk=float(state.ne.max()), ni_pk=float(state.ni.max()),
         ars_pk=float(state.n_ars.max()),
         Te_pk=float(Te[act].max()) if act.any() else np.nan,
+        eps_bar_pk=float(eps_bar.max()) if act.any() else np.nan,
+        qn_dev=qn_dev, ss_tot=ss_tot, floored_frac=floored,
+        clamped_frac=clamped,
         Phi_pk=float(state.Phi[act].max()) if act.any() else np.nan,
-        I_coil=state.I_coil, pen_depth=pen,
+        I_coil=state.I_coil, pen_depth=pen, P_target=P_target,
+        ramp_frac=frac,
+        # pseudo-clock statistics. There is NO global time: dt is
+        # per-cell and rebuilt every iteration, so these are a spread,
+        # not a timestep. `slice_advance` is only the median cell's
+        # nominal advance through one FKPM slice.
+        dt_e_med=float(np.median(dt_e[act])) if act.any() else np.nan,
+        dt_i_med=float(np.median(dt_i[act])) if act.any() else np.nan,
+        dt_eps_med=float(np.median(dt_eps[act])) if act.any() else np.nan,
+        dt_e_min=float(dt_e[act].min()) if act.any() else np.nan,
+        dt_e_max=float(dt_e[act].max()) if act.any() else np.nan,
+        # The FKPM runs ONE common clock per cell -- inside the stepper
+        # dt_i = dt_eps = dt_e = min(all three, then re-clipped against
+        # the ion Courant rate and the sheath-RC limit at the evolving
+        # field). So dt_e alone is only a ceiling; the effective clock
+        # is the elementwise minimum, and whichever species sets it
+        # governs the whole slice.
+        dt_eff_med=(float(np.median(np.minimum(np.minimum(dt_e, dt_i),
+                                               dt_eps)[act]))
+                    if act.any() else np.nan),
+        # measured in-loop advance of the slice just taken (s)
+        slice_advance=float(drv.last_slice_advance),
         emm_refreshed=emm_refreshed, chem_refreshed=chem_refreshed)
     return state, diag
 
@@ -825,9 +1112,49 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
     consecutive = 0
     converged = False
 
+    ramp_step = 1
+    accel_since = None                 # first iteration acceleration applied
+    applied_accel_prev = False
     for it in range(1, num.max_outer + 1):
         t0 = time.time()
-        state, diag = outer_iteration(setup, num, drivers, state)
+        ramping = ramp_step < int(num.P_ramp_iters)
+        last_good = state
+        try:
+            state, diag = outer_iteration(setup, num, drivers, state,
+                                          ramp_step)
+        except RuntimeError as exc:
+            print(f"[{it:4d}] outer_iteration failed: {exc}")
+            print("       returning the last finite state; history is "
+                  "complete up to the previous iteration.")
+            return last_good, history, False
+        # A diverged iteration poisons everything downstream, and the
+        # symptom surfaces later as a confusing "EMM deposited no power"
+        # (the NaN sigma makes P_dep vanish). Catch it here, on the
+        # iteration that actually broke, and hand back the last finite
+        # state so diagnostics and plots still have something to show.
+        # Finiteness alone is NOT a sufficient health test: a solver
+        # breakdown has been observed to return finite garbage (8e77
+        # m^-3), which froze the clock (dt_chem -> 0) and let the
+        # convergence contract certify the wreckage (a frozen state has
+        # rel -> 0 by construction). Bound every density by physics: no
+        # species can exceed the neutral inventory by more than a small
+        # factor, and Phi in a bounded device cannot reach kilovolts.
+        ng = setup.case.ng
+        ceil = 10.0 * ng
+        bad = [k for k, v, c in (("ne", state.ne, ceil),
+                                 ("ni", state.ni, ceil),
+                                 ("n_ars", state.n_ars, ceil),
+                                 ("n_eps", state.n_eps, 1e3 * ng),
+                                 ("Phi", state.Phi, 1.0e4))
+               if not np.all(np.isfinite(v)) or float(np.max(np.abs(v))) > c]
+        if bad:
+            print(f"[{it:4d}] DIVERGED: non-finite or unphysical "
+                  f"{', '.join(bad)}. "
+                  f"Last applied acceleration: "
+                  f"{'yes' if applied_accel_prev else 'no'}.")
+            print("       returning the last finite state (iteration "
+                  f"{it - 1}).")
+            return last_good, history, False
 
         # -- convergence metric on the pre-acceleration physics state ------ #
         Te = diag["Te"]
@@ -845,15 +1172,36 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
             rels, rel = {}, np.inf
         prev = dict(ne=state.ne, ars=state.n_ars, Te=Te, Phi=state.Phi)
 
+        # -- ramp advance --------------------------------------------------- #
+        if ramping:
+            gate = num.P_ramp_gate_rel
+            if gate is None or (np.isfinite(rel) and rel < gate):
+                ramp_step += 1
+
         # -- acceleration control (doc Sec. 12.4b) -------------------------- #
-        if accel_enabled and rel < num.accel_off_rel:
+        # Nothing about the ramp phase is a fixed point: `rel` measures
+        # the response to a moving power target, so neither the accel-off
+        # latch nor the Eq. 56 extrapolation may act on it (extrapolating
+        # a driven transient amplifies it).
+        if accel_enabled and rel < num.accel_off_rel and not ramping:
             accel_enabled = False
             unaccel_since = it
             # entering the final unaccelerated phase on fresh inputs
             drivers.refresh_chem(state.n_ars, force=True)
         applied_accel = False
-        if accel_enabled and it >= num.accel_start:
-            state = accelerate(setup, num, state)
+        if (num.use_accel and accel_enabled and it >= num.accel_start
+                and not ramping):
+            if accel_since is None:
+                accel_since = it
+            n_w = max(int(num.accel_warmup), 0)
+            if n_w > 0 and (it - accel_since) < n_w:
+                # geometric warm-up delta_max0 -> delta_max
+                f = (it - accel_since) / n_w
+                dmax = num.delta_max0 * (num.delta_max
+                                         / max(num.delta_max0, 1e-30)) ** f
+            else:
+                dmax = num.delta_max
+            state = accelerate(setup, num, state, delta_max=dmax)
             applied_accel = True
         # Eq. 56 recorded history = end-of-iteration (post-accel) values
         state = replace(state, ni_prev=state.ni, ars_prev=state.n_ars)
@@ -864,7 +1212,12 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
                    **{k: diag[k] for k in
                       ("ne_pk", "ni_pk", "ars_pk", "Te_pk", "Phi_pk",
                        "I_coil", "pen_depth", "emm_refreshed",
-                       "chem_refreshed")},
+                       "chem_refreshed", "P_target", "ramp_frac",
+                       "eps_bar_pk", "clamped_frac", "qn_dev", "ss_tot",
+                       "floored_frac",
+                       "dt_e_med",
+                       "dt_i_med", "dt_eps_med", "dt_e_min", "dt_e_max",
+                       "dt_eff_med", "slice_advance")},
                    **{k: led[k] for k in
                       ("P_in", "P_es", "P_wall", "P_el", "P_inel",
                        "imbalance", "imbalance_no_es", "P_ars_wall")})
@@ -873,7 +1226,8 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
             flags = "".join(f for f, on in
                             (("E", diag["emm_refreshed"]),
                              ("C", diag["chem_refreshed"]),
-                             ("A", applied_accel)) if on)
+                             ("A", applied_accel),
+                             ("R", ramping)) if on)
             print(f"[{it:4d}] ne={rec['ne_pk']:.3e}  Ar*={rec['ars_pk']:.3e}"
                   f"  Te={rec['Te_pk']:5.2f}  Phi={rec['Phi_pk']:6.2f} V"
                   f"  | P {led['P_in']:.1f}(+ES {led['P_es']:.1f})"
@@ -881,11 +1235,15 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
                   f" + inel {led['P_inel']:.1f} W"
                   f"  imb {led['imbalance']:.2%}"
                   f"  rel {rel:.2e}  [{flags}]")
+        applied_accel_prev = applied_accel
         if callback is not None:
             callback(it, state, rec)
 
         # -- convergence contract ------------------------------------------ #
-        if not accel_enabled and rel < num.tol:
+        # The ramp phase can be quiet (a small power increment produces a
+        # small `rel`) without being converged, so it can never count
+        # toward the convergence streak.
+        if not accel_enabled and rel < num.tol and not ramping:
             consecutive += 1
         else:
             consecutive = 0
@@ -918,12 +1276,15 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
 # Convenience: recompute the converged heating field for diagnostics
 # ----------------------------------------------------------------------------
 
-def heating_field(setup: HybridSetup, state: HybridState) -> np.ndarray:
+def heating_field(setup: HybridSetup, state: HybridState,
+                  P_W: float | None = None) -> np.ndarray:
     """Q_ind (W/m^3) of the stored A at the current sigma, renormalized
     to P_set -- identical to what the next outer iteration would feed
-    the energy equation."""
+    the energy equation. Pass `P_W` to renormalize to a ramped target
+    instead (mid-ramp the full-power Q does not match the state)."""
     case = setup.case
     sigma = inductive.cold_plasma_sigma(state.ne, case.nu_m, case.omega)
     Q = inductive.power_deposition(state.A, sigma, case.omega)
     P = float(np.sum(Q * setup.top.volume * setup.top.active))
-    return Q * (case.P_set_W / max(P, 1.0e-30))
+    target = case.P_set_W if P_W is None else P_W
+    return Q * (target / max(P, 1.0e-30))

@@ -55,11 +55,12 @@ try:  # package layout
     from waferkinetic.solvers.transport import (
         QE, ME, TransportOperator, TransportCoeffsJAX,
         divergence, flux_drift_diffusion, wall_flux_thermal, stable_dt,
-        local_dt)
+        local_dt, _face_vals_r, _face_vals_z)
 except ImportError:  # flat layout
     from transport import (QE, ME, TransportOperator, TransportCoeffsJAX,
                            divergence, flux_drift_diffusion,
-                           wall_flux_thermal, stable_dt, local_dt)
+                           wall_flux_thermal, stable_dt, local_dt,
+                           _face_vals_r, _face_vals_z)
 
 #: Gamma_eps coefficients relative to Gamma_e (doc Eq. 13).
 ENERGY_FLUX_FACTOR = 5.0 / 3.0
@@ -119,7 +120,8 @@ def temperature(ne: np.ndarray, n_eps: np.ndarray,
 def electron_rhs(op: TransportOperator, ne: np.ndarray, n_eps: np.ndarray,
                  Er: np.ndarray, Ez: np.ndarray, S_ext_eV: np.ndarray,
                  p: ElectronParams, S_e: np.ndarray | None = None,
-                 inelastic=None, evolve_ne: bool = False):
+                 inelastic=None, evolve_ne: bool = False,
+                 es_joule: str = "drift"):
     """Tendencies (dne/dt, dneps/dt, Te).
 
     S_ext_eV : external heating in eV m^-3 s^-1 -- pass Q_ind / q with
@@ -142,7 +144,16 @@ def electron_rhs(op: TransportOperator, ne: np.ndarray, n_eps: np.ndarray,
     Wr, Wz = wall_flux_thermal(op, n_eps, vth, ce)
     Erc = 0.5 * (Er[:-1, :] + Er[1:, :])
     Ezc = 0.5 * (Ez[:, :-1] + Ez[:, 1:])
-    S = (S_ext_eV + ne * mu * (Erc ** 2 + Ezc ** 2)
+    if es_joule == "drift":                       # doc Eq. 12
+        S_es = ne * mu * (Erc ** 2 + Ezc ** 2)
+    else:                                          # -Gamma_e . E_S
+        Fre, Fze = flux_drift_diffusion(op, ne, mu * Te, mu, -1.0, Er, Ez)
+        ir = op.int_r.astype(float)
+        iz = op.int_z.astype(float)
+        Frc = 0.5 * (ir[:-1, :] * Fre[:-1, :] + ir[1:, :] * Fre[1:, :])
+        Fzc = 0.5 * (iz[:, :-1] * Fze[:, :-1] + iz[:, 1:] * Fze[:, 1:])
+        S_es = -(Frc * Erc + Fzc * Ezc)
+    S = (S_ext_eV + S_es
          - 3.0 * p.mass_ratio * np.asarray(p.nu_m) * ne * (Te - p.Tg_eV))
     if inelastic is not None:
         S = S - (inelastic(ne, Te) if callable(inelastic) else inelastic)
@@ -206,12 +217,43 @@ def energy_local_dt(op: TransportOperator, ne: np.ndarray, n_eps: np.ndarray,
                     dt_max=dt_max)
 
 
+def sheath_factors(op: TransportOperator, Phi: np.ndarray, Te: np.ndarray,
+                   Te_min: float = 0.02):
+    """Boltzmann multipliers exp(-(Phi_p - Phi_w)/Te) on the r/z wall
+    faces (see poisson.sheath_r). 1.0 away from walls."""
+    PW, PE = _face_vals_r(Phi)
+    TW, TE = _face_vals_r(np.maximum(Te, Te_min))
+    br = 1.0 + np.where(op.wall_e,
+                        np.exp(-np.maximum(PW - PE, 0.0)
+                               / np.where(TW > 0, TW, 1.0)) - 1.0, 0.0) \
+        + np.where(op.wall_w,
+                   np.exp(-np.maximum(PE - PW, 0.0)
+                          / np.where(TE > 0, TE, 1.0)) - 1.0, 0.0)
+    PS, PN = _face_vals_z(Phi)
+    TS, TN = _face_vals_z(np.maximum(Te, Te_min))
+    bz = 1.0 + np.where(op.wall_n,
+                        np.exp(-np.maximum(PS - PN, 0.0)
+                               / np.where(TS > 0, TS, 1.0)) - 1.0, 0.0) \
+        + np.where(op.wall_s,
+                   np.exp(-np.maximum(PN - PS, 0.0)
+                          / np.where(TN > 0, TN, 1.0)) - 1.0, 0.0)
+    return br, bz
+
+
 def wall_energy_power(op: TransportOperator, n_eps: np.ndarray,
-                      Te: np.ndarray, p: ElectronParams) -> float:
+                      Te: np.ndarray, p: ElectronParams,
+                      Phi: np.ndarray | None = None,
+                      wall_flux: str = "thermal") -> float:
     """Total electron energy loss to walls (W), doc Eq. 36 second relation.
-    Wall fluxes are oriented outward, so the total is sum(A |F|) q."""
+    Wall fluxes are oriented outward, so the total is sum(A |F|) q.
+    Pass `Phi` with wall_flux="sheath" to apply the Boltzmann throttle --
+    it MUST match the form the stepper used or the ledger is meaningless.
+    """
     ce = WALL_ENERGY * (1.0 - p.re) / (1.0 + p.re)
     Wr, Wz = wall_flux_thermal(op, n_eps, thermal_speed(Te), ce)
+    if wall_flux == "sheath" and Phi is not None:
+        br, bz = sheath_factors(op, Phi, Te, p.Te_min)
+        Wr, Wz = br * Wr, bz * Wz
     return float((np.sum(op.area_r * np.abs(Wr))
                   + np.sum(op.area_z * np.abs(Wz))) * QE)
 
@@ -221,7 +263,8 @@ def wall_energy_power(op: TransportOperator, n_eps: np.ndarray,
 # ----------------------------------------------------------------------------
 
 def make_jax_energy_stepper(coeffs: TransportCoeffsJAX, p: ElectronParams,
-                            inelastic_fn=None, n_sub: int = 200):
+                            inelastic_fn=None, n_sub: int = 200,
+                            es_joule: str = "drift"):
     """Return a jitted stepper
 
         step(n_eps, ne, Er, Ez, S_ext_eV, dt) -> n_eps'
@@ -260,7 +303,29 @@ def make_jax_energy_stepper(coeffs: TransportCoeffsJAX, p: ElectronParams,
         ne_eff = jnp.maximum(ne, p.ne_floor)
         Erc = 0.5 * (Er[:-1, :] + Er[1:, :])
         Ezc = 0.5 * (Ez[:, :-1] + Ez[:, 1:])
-        S0 = S_ext_eV + ne * mu * (Erc ** 2 + Ezc ** 2)
+        # Electrostatic heating, frozen at entry ne (this slice holds ne
+        # fixed). MUST match the form used by the FKPM stepper and by
+        # `hybrid.power_ledger`: mixing forms across slices puts an
+        # uncounted source in the loop, which shows up as a ledger that
+        # reports a net sink while n_eps rises.
+        if es_joule == "drift":                    # doc Eq. 12
+            S0 = S_ext_eV + ne * mu * (Erc ** 2 + Ezc ** 2)
+        else:                                      # -Gamma_e . E_S
+            Te0 = jnp.clip((2.0 / 3.0) * n_eps / ne_eff, p.Te_min, p.Te_max)
+            G0 = mu * Te0 * ne
+            vr0 = -0.5 * (padW(mu) + padE(mu)) * Er
+            vz0 = -0.5 * (padS(mu) + padN(mu)) * Ez
+            Fre = c.int_r * (-(padE(G0) - padW(G0)) / c.dc_r
+                             + vr0 * jnp.where(vr0 > 0.0, padW(ne),
+                                               padE(ne)))
+            Fze = c.int_z * (-(padN(G0) - padS(G0)) / c.dc_z
+                             + vz0 * jnp.where(vz0 > 0.0, padS(ne),
+                                               padN(ne)))
+            Frc = 0.5 * (c.int_r[:-1, :] * Fre[:-1, :]
+                         + c.int_r[1:, :] * Fre[1:, :])
+            Fzc = 0.5 * (c.int_z[:, :-1] * Fze[:, :-1]
+                         + c.int_z[:, 1:] * Fze[:, 1:])
+            S0 = S_ext_eV - (Frc * Erc + Fzc * Ezc)
         el = 3.0 * p.mass_ratio * nu_m * ne
         vr = -c53 * 0.5 * (padW(mu) + padE(mu)) * Er   # electron sign = -1
         vz = -c53 * 0.5 * (padS(mu) + padN(mu)) * Ez
