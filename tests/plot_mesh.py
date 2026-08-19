@@ -1,4 +1,4 @@
-"""
+""""
 plot_mesh.py
 ============
 Draw the mesh actually in use and report the cell size at every
