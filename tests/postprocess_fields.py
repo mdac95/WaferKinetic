@@ -205,6 +205,11 @@ def main():
     for jw, name in ((jlo, "bottom"), (jhi, "top")):
         dPhi = Phi_all[ir, j_pk] - Phi_all[ir, jw]
         Te_w = Te[ir, jw]
+        # doc P6 / ASM dumps (chi > 0): the analytic barrier
+        # dPhi_b = chi * Te_wall sits OUTSIDE the mesh; the total
+        # plasma-to-surface drop is the in-mesh part plus the barrier.
+        chi = float(d["chi"]) if "chi" in d.files else 0.0
+        dPhi = dPhi + chi * Te_w
         rows.append((name, dPhi, Te_w, dPhi / max(Te_w, 1e-30)))
     a = ax[1, 0]
     x = np.arange(len(rows))

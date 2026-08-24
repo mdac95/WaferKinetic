@@ -640,14 +640,15 @@ def _species_fluxes(top: TransportOperator, pop: PoissonOperator,
                     ne, ni, Te, Er, Ez, p: FKPMParams,
                     dt_e=None, dt_i=None, ion_wall: str = "thermal",
                     wall_flux: str = "thermal", Phi=None,
-                    Er_i=None, Ez_i=None):
+                    Er_i=None, Ez_i=None, sheath_model: str = "resolved"):
     """Full (interior + wall) face fluxes for electrons and the ion at the
     given field: doc Eq. 23 drift-diffusion + Eq. 36/37 walls.  When a
     species dt is given, its wall fluxes are positivity-limited with
     `_limit_outflow` (required whenever the fluxes feed a time
     update)."""
+    asm = sheath_model == "asm"
+    M_i = 8.0 * QE * p.T_i_eV / (np.pi * p.vth_i ** 2)
     if ion_wall == "bohm":
-        M_i = 8.0 * QE * p.T_i_eV / (np.pi * p.vth_i ** 2)
         vth_eff = np.maximum(p.vth_i,
                              4.0 * np.sqrt(QE * np.maximum(Te, p.Te_min)
                                            / M_i))
@@ -658,7 +659,7 @@ def _species_fluxes(top: TransportOperator, pop: PoissonOperator,
     vth_e = np.sqrt(8.0 * QE * Te / (np.pi * ME))
     Fr_e, Fz_e = flux_drift_diffusion(top, ne, mu_e * Te, mu_e, -1.0, Er, Ez)
     Wr, Wz = wall_flux_thermal(top, ne, vth_e, cp)
-    if wall_flux == "sheath" and Phi is not None:
+    if (asm or wall_flux == "sheath") and Phi is not None:
         # Boltzmann throttle of the unresolved sheath, mirroring the
         # jitted `sheath_r`/`sheath_z`: WITHOUT this the dumped electron
         # wall flux is the raw thermal one while the run used the
@@ -689,7 +690,14 @@ def _species_fluxes(top: TransportOperator, pop: PoissonOperator,
     Ezi = Ez if Ez_i is None else Ez_i
     Fr_i, Fz_i = flux_drift_diffusion(top, ni, p.D_i, p.mu_i, +1.0,
                                       Eri, Ezi)
-    Wr, Wz = wall_flux_ion(top, ni, p.mu_i, +1.0, Eri, Ezi, vth_eff, 1.0)
+    if asm:
+        # doc P6: n.Gamma_i = n u_B(Te) -- Bohm criterion at the sheath
+        # edge; no thermal term, no drift term (mirrors `i_fluxes`).
+        ub = np.sqrt(QE * np.maximum(Te, p.Te_min) / M_i)
+        Wr, Wz = wall_flux_thermal(top, ni, ub, 1.0)
+    else:
+        Wr, Wz = wall_flux_ion(top, ni, p.mu_i, +1.0, Eri, Ezi,
+                               vth_eff, 1.0)
     Fr_i, Fz_i = Fr_i + Wr, Fz_i + Wz
     if dt_i is not None:
         Fr_i, Fz_i = _limit_outflow(top, ni, Fr_i, Fz_i, dt_i)
@@ -1053,7 +1061,8 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                           ion_field: str = "static",
                           implicit_electrons: bool = False,
                           n_gummel: int = 2, im_tol: float = 1e-9,
-                          im_maxiter: int = 2000):
+                          im_maxiter: int = 2000,
+                          sheath_model: str = "resolved"):
     """Return a jitted coupled FKPM stepper
 
         step(ne, ni, n_eps, ss_r, ss_z, Phi, dt_e, dt_i, dt_eps, S_ext_eV)
@@ -1200,6 +1209,24 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
         ~5 Te (measured: 6.5 at the wafer with the drift assist).
         DEPARTS FROM doc Eq. 37; amend it before quoting results."""
         G = p.D_i * N
+        if _asm and Te is not None:
+            # doc P6: "positive ions pass unhindered" = the Bohm
+            # criterion at the sheath edge, n.Gamma = n_donor u_B(Te).
+            # No thermal term, no drift term, no dependence on the (now
+            # unresolved) wall-cell field. Interior fluxes unchanged.
+            thW = _uB(jnp.maximum(padW(Te), p.Te_min)) * padW(N)
+            thE = _uB(jnp.maximum(padE(Te), p.Te_min)) * padE(N)
+            thS = _uB(jnp.maximum(padS(Te), p.Te_min)) * padS(N)
+            thN = _uB(jnp.maximum(padN(Te), p.Te_min)) * padN(N)
+            vr = p.mu_i * Er
+            Fr = tc.int_r * (-(padE(G) - padW(G)) / tc.dc_r
+                             + vr * jnp.where(vr > 0.0, padW(N), padE(N)))
+            vz = p.mu_i * Ez
+            Fz = tc.int_z * (-(padN(G) - padS(G)) / tc.dc_z
+                             + vz * jnp.where(vz > 0.0, padS(N), padN(N)))
+            Wr = tc.wall_e * thW - tc.wall_w * thE
+            Wz = tc.wall_n * thS - tc.wall_s * thN
+            return limit_outflow(N, Fr + Wr, Fz + Wz, dt)
         if ion_wall == "bohm" and Te is not None:
             ub = _uB(jnp.maximum(Te, p.Te_min))
             th = jnp.maximum(0.25 * p.vth_i, ub) * N
@@ -1310,6 +1337,91 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
     #: closure wrongly lets them do inside the smeared sheath.
     _NU_I = QE / (_MI * p.mu_i)
 
+    if sheath_model not in ("resolved", "asm"):
+        raise ValueError("sheath_model must be 'resolved' or 'asm'")
+    if sheath_model == "asm" and not implicit_electrons:
+        raise NotImplementedError(
+            "sheath_model='asm' is implemented on the implicit (P3) path "
+            "only; the explicit stepper is kept verbatim")
+    _asm = sheath_model == "asm"
+    #: Doc P6 (ASM) analytic floating barrier dPhi_b = _CHI * Te: zero
+    #: net current n_se u_B = c_p vth_e n_se exp(-dPhi_b/Te), and both
+    #: speeds scale as sqrt(Te), so the ratio is a constant of the gas
+    #: and r_e alone, CHI = ln(c_p sqrt(8 M_i / (pi m_e))) (= 4.97 for
+    #: argon at r_e = 0.2). The multiplier exp(-CHI) = u_B/(c_p vth_e)
+    #: is Te-INDEPENDENT: the ASM electron wall flux reduces to
+    #: n_e u_B exactly, matching the ion Bohm flux at quasineutrality.
+    _CHI = float(np.log(cp * np.sqrt(8.0 * float(_MI) / (np.pi * ME))))
+
+    if _asm:
+        # Poisson battery (doc Eq. 34): every live plasma-boundary face
+        # carries the analytic jump dPhi_b = _CHI * Te(donor); the face
+        # flux becomes g (Phi_P - Phi_X - dPhi_b), i.e. the mesh sees
+        # the SHEATH EDGE, on dielectric interfaces and Dirichlet metal
+        # alike. Implemented as an antisymmetric RHS-only term
+        # (+g dPhi_b on the plasma row, -g dPhi_b on a solved neighbor
+        # row; unsolved Dirichlet rows are discarded by the solver's
+        # b-masking), so the operator stays SPD and the P2 delta form
+        # still cancels at stationarity: the converged Phi satisfies
+        # Eq. 34 exactly.
+        _batW_r = pc.wpl_r * (1.0 - pc.epl_r) * pc.live_r   # plasma west
+        _batE_r = pc.epl_r * (1.0 - pc.wpl_r) * pc.live_r   # plasma east
+        _batS_z = pc.spl_z * (1.0 - pc.npl_z) * pc.live_z
+        _batN_z = pc.npl_z * (1.0 - pc.spl_z) * pc.live_z
+
+        # ENERGY-equation wall multiplier: escaping electrons remove
+        # their sheath-edge kinetic energy -- 2Te wall arrival PLUS the
+        # CLIMB spent against the barrier (handed to the ions via the
+        # battery; the resolved path debits it through the in-mesh
+        # -Gamma_e.E work, which left the mesh with the sheath).
+        # Flux-averaged edge energy of escapers through a retarding
+        # barrier x = dPhi_face/Te is (2 + x) Te, so the Eq. 36 energy
+        # flux ce vth n_eps carries exp(-x) (1 + 0.4 x) with the SAME
+        # mesh-Phi face drop the particle throttle sees (equals
+        # exp(-CHI)(1 + 2 CHI/5) at the equilibrium barrier). Ledger
+        # mirror: hybrid.power_ledger.
+        def sheath_eps_r(Phi, Te):
+            tW = jnp.maximum(padW(Te), p.Te_min)
+            tE = jnp.maximum(padE(Te), p.Te_min)
+            xE = jnp.maximum(padW(Phi) - padE(Phi), 0.0) / tW
+            xW = jnp.maximum(padE(Phi) - padW(Phi), 0.0) / tE
+            fE = jnp.exp(-xE) * (1.0 + 0.4 * xE)
+            fW = jnp.exp(-xW) * (1.0 + 0.4 * xW)
+            return 1.0 + tc.wall_e * (fE - 1.0) + tc.wall_w * (fW - 1.0)
+
+        def sheath_eps_z(Phi, Te):
+            tS = jnp.maximum(padS(Te), p.Te_min)
+            tN = jnp.maximum(padN(Te), p.Te_min)
+            xN = jnp.maximum(padS(Phi) - padN(Phi), 0.0) / tS
+            xS = jnp.maximum(padN(Phi) - padS(Phi), 0.0) / tN
+            fN = jnp.exp(-xN) * (1.0 + 0.4 * xN)
+            fS = jnp.exp(-xS) * (1.0 + 0.4 * xS)
+            return 1.0 + tc.wall_n * (fN - 1.0) + tc.wall_s * (fS - 1.0)
+
+        def bat_rhs(Te):
+            qr = pc.g_r * _CHI * (_batW_r * padW(Te) + _batE_r * padE(Te))
+            qz = pc.g_z * _CHI * (_batS_z * padS(Te) + _batN_z * padN(Te))
+            sr = (_batW_r - _batE_r) * qr
+            sz = (_batS_z - _batN_z) * qz
+            return sr[1:, :] - sr[:-1, :] + sz[:, 1:] - sz[:, :-1]
+
+        def efield_se(Phi, Te):
+            """Sheath-EDGE field: `efield` minus the battery jump at
+            plasma-boundary faces. Raw differencing across a battery
+            face reads ~dPhi_b/dc (observed 2.1e5 V/m at the wafer) --
+            a field NO flux uses on the ASM path (wall fluxes are u_B,
+            interior stencils are masked off wall faces) -- yet the ion
+            Courant clip would see it and, under uniform_dt, collapse
+            the global clock to ~4e-11 s. Used for the in-loop clip
+            rates only; the Poisson solve and all fluxes are
+            unaffected."""
+            Er, Ez = efield(Phi)
+            dphi_r = _CHI * (_batW_r * padW(Te) + _batE_r * padE(Te))
+            dphi_z = _CHI * (_batS_z * padS(Te) + _batN_z * padN(Te))
+            Er = Er + (_batE_r - _batW_r) * dphi_r / pc.dcp_r
+            Ez = Ez + (_batN_z - _batS_z) * dphi_z / pc.dcp_z
+            return Er, Ez
+
     def sheath_r(Phi, Te):
         """Multiplier on the r-direction electron wall flux.
 
@@ -1330,7 +1442,16 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
         that sets the explicit stability limit. DEPARTS FROM doc
         Eq. 36; amend it before quoting any result produced this way.
         """
-        if wall_flux == "thermal":
+        # ASM uses the SAME mesh-Phi Boltzmann throttle: the battery
+        # makes the equilibrium face drop equal the analytic CHI Te, so
+        # the converged flux is n_e u_B -- but off equilibrium the flux
+        # RESPONDS to Phi, which is the discharge's charge regulator (a
+        # frozen exp(-CHI) multiplier pumps net charge without bound:
+        # the state drifts charge-inconsistent under the delta-form
+        # march until it snaps -- observed at it 1047). The response is
+        # ~143x softer than the resolved path (u_B scale), so the
+        # sheath-RC limit stays unbound.
+        if wall_flux == "thermal" and not _asm:
             return 1.0
         tW = jnp.maximum(padW(Te), p.Te_min)
         tE = jnp.maximum(padE(Te), p.Te_min)
@@ -1339,7 +1460,7 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
         return 1.0 + tc.wall_e * (fE - 1.0) + tc.wall_w * (fW - 1.0)
 
     def sheath_z(Phi, Te):
-        if wall_flux == "thermal":
+        if wall_flux == "thermal" and not _asm:
             return 1.0
         tS = jnp.maximum(padS(Te), p.Te_min)
         tN = jnp.maximum(padN(Te), p.Te_min)
@@ -1709,6 +1830,10 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
             # ionization source; dt_eps != dt_e gives Te spurious
             # pseudo-dynamics -- see the explicit body's comments).
             Er0, Ez0 = efield(Phi)
+            if _asm:
+                # clip rates must see the sheath-edge field, not the
+                # battery-jump differencing artifact (see `efield_se`)
+                Er0, Ez0 = efield_se(Phi, Te)
             # field the IONS respond to: the Richards effective field on
             # the "effective" path (lagged one substep -- it relaxes at
             # the END of the substep toward the final field), the true
@@ -1721,35 +1846,111 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                     clip_dt(dti0, stab_rate(
                         p.D_i * jnp.ones_like(ne),
                         p.mu_i * jnp.ones_like(ne), Eir_u, Eiz_u)))
-                # sheath-RC charging limit (verbatim from the explicit
-                # body): one substep may change a wall face field by at
-                # most ~courant_clip x its current scale.
-                fe_c = cp * vth_e * ne
-                if ion_wall == "bohm":
-                    fi_c = jnp.maximum(0.25 * p.vth_i,
-                                       _uB(jnp.maximum(Te, p.Te_min))) * ni
+                # Explicit surface-charge (sigma_s) stability -- the
+                # limit that BINDS once P6 takes the sheath out of the
+                # mesh. The quantity is the DIFFERENTIAL conductance
+                # dGamma_e/dPhi = Gamma_e/Te, never the net current:
+                # the barrier drives the net current to zero at the
+                # ambipolar balance, so a net-current estimate reports
+                # "no limit" exactly where the feedback loop is
+                # stiffest. (The resolved path's net-current estimate
+                # has the same defect, documented as ~6x too
+                # permissive; on the ASM path it is unbounded, and the
+                # run detonates once the density has grown enough --
+                # measured: ne * dt at failure is constant.)
+                # Linearising the face charge against its own potential
+                # response,
+                #   d(dsigma)/dt = -q (dGamma_e/dPhi)(dPhi/dsigma) dsigma,
+                #   dPhi/dsigma  = A/g   (exact face conductance, so the
+                #                         dielectric permittivity counts)
+                # gives rate = q Gamma_e A / (g Te). Restricted to the
+                # dielectric faces: grounded metal holds Phi by
+                # Dirichlet, so no explicit surface-charge loop exists
+                # there. NOTE the rate GROWS with cell size (a thicker
+                # capacitor gap is more volts per coulomb) -- the
+                # opposite of the ion Courant bound, so coarsening the
+                # wall cells trades one limit for the other.
+                if _asm:
+                    fe_c = cp * vth_e * ne
+                    brq, bzq = sheath_r(Phi, Te), sheath_z(Phi, Te)
+                    ge_r = brq * (tc.wall_e * padW(fe_c)
+                                  + tc.wall_w * padE(fe_c))
+                    ge_z = bzq * (tc.wall_n * padS(fe_c)
+                                  + tc.wall_s * padN(fe_c))
+                    Te_fr = jnp.maximum(padW(Te), padE(Te))
+                    Te_fz = jnp.maximum(padS(Te), padN(Te))
+                    gr_safe = jnp.where(pc.g_r > 0.0, pc.g_r, 1.0)
+                    gz_safe = jnp.where(pc.g_z > 0.0, pc.g_z, 1.0)
+                    rq_r = jnp.where(
+                        pc.g_r > 0.0,
+                        QE * (pc.scE_r + pc.scW_r) * ge_r * pc.area_r
+                        / (gr_safe * Te_fr), 0.0)
+                    rq_z = jnp.where(
+                        pc.g_z > 0.0,
+                        QE * (pc.scN_z + pc.scS_z) * ge_z * pc.area_z
+                        / (gz_safe * Te_fz), 0.0)
+                    # This rate IS the linear relaxation rate lambda of
+                    # the surface-charge mode, so its stability bound is
+                    # the explicit-Euler one, lambda*dt < 2 -- not a
+                    # Courant number. Clip at lambda*dt <= 1 (a factor-2
+                    # margin). Calibration: at the converged fine-mesh
+                    # ASM state lambda = 4.5e9 /s and the run is stable
+                    # at dt = 1.4e-10, i.e. lambda*dt = 0.64, so 1.0 is
+                    # the right order and courant_clip (0.4) would
+                    # needlessly slow the working path by ~1.6x.
+                    rate_sig = jnp.maximum(
+                        jnp.maximum(rq_r[1:, :], rq_r[:-1, :]),
+                        jnp.maximum(rq_z[:, 1:], rq_z[:, :-1]))
+                    safe_sig = jnp.where(rate_sig > 0.0, rate_sig, 1.0)
+                    dte = jnp.where(rate_sig > 0.0,
+                                    jnp.minimum(dte, 1.0 / safe_sig), dte)
+                    # ... and KEEP the net-current estimate as transient
+                    # protection: far from the ambipolar balance (during
+                    # ignition, or after any kick) the gross imbalance is
+                    # the larger rate, and dropping it made a run fail
+                    # EARLIER, not later.
+                    fi_c = _uB(jnp.maximum(Te, p.Te_min)) * ni
+                    gw_r = (tc.wall_e * jnp.abs(brq * padW(fe_c)
+                                                - padW(fi_c))
+                            + tc.wall_w * jnp.abs(brq * padE(fe_c)
+                                                  - padE(fi_c)))
+                    gw_z = (tc.wall_n * jnp.abs(bzq * padS(fe_c)
+                                                - padS(fi_c))
+                            + tc.wall_s * jnp.abs(bzq * padN(fe_c)
+                                                  - padN(fi_c)))
+                    es_r = jnp.maximum(jnp.abs(Er0), Te_fr / tc.dc_r)
+                    es_z = jnp.maximum(jnp.abs(Ez0), Te_fz / tc.dc_z)
+                    rq_r = QE * gw_r / (EPS0 * es_r)
+                    rq_z = QE * gw_z / (EPS0 * es_z)
                 else:
-                    fi_c = 0.25 * p.vth_i * ni
-                mi_ni = p.mu_i * ni
-                brq, bzq = sheath_r(Phi, Te), sheath_z(Phi, Te)
-                gw_r = brq * (tc.wall_e * jnp.abs(padW(fe_c) - padW(fi_c)
-                                                  - padW(mi_ni)
-                                                  * jnp.abs(Eir_u))
-                              + tc.wall_w * jnp.abs(padE(fe_c) - padE(fi_c)
-                                                    - padE(mi_ni)
-                                                    * jnp.abs(Eir_u)))
-                gw_z = bzq * (tc.wall_n * jnp.abs(padS(fe_c) - padS(fi_c)
-                                                  - padS(mi_ni)
-                                                  * jnp.abs(Eiz_u))
-                              + tc.wall_s * jnp.abs(padN(fe_c) - padN(fi_c)
-                                                    - padN(mi_ni)
-                                                    * jnp.abs(Eiz_u)))
-                Te_fr = jnp.maximum(padW(Te), padE(Te))
-                Te_fz = jnp.maximum(padS(Te), padN(Te))
-                es_r = jnp.maximum(jnp.abs(Er0), Te_fr / tc.dc_r)
-                es_z = jnp.maximum(jnp.abs(Ez0), Te_fz / tc.dc_z)
-                rq_r = QE * gw_r / (EPS0 * es_r)
-                rq_z = QE * gw_z / (EPS0 * es_z)
+                    # resolved path: verbatim from the explicit body
+                    fe_c = cp * vth_e * ne
+                    if ion_wall == "bohm":
+                        fi_c = jnp.maximum(
+                            0.25 * p.vth_i,
+                            _uB(jnp.maximum(Te, p.Te_min))) * ni
+                    else:
+                        fi_c = 0.25 * p.vth_i * ni
+                    mi_ni = p.mu_i * ni
+                    brq, bzq = sheath_r(Phi, Te), sheath_z(Phi, Te)
+                    gw_r = brq * (
+                        tc.wall_e * jnp.abs(padW(fe_c) - padW(fi_c)
+                                            - padW(mi_ni) * jnp.abs(Eir_u))
+                        + tc.wall_w * jnp.abs(padE(fe_c) - padE(fi_c)
+                                              - padE(mi_ni)
+                                              * jnp.abs(Eir_u)))
+                    gw_z = bzq * (
+                        tc.wall_n * jnp.abs(padS(fe_c) - padS(fi_c)
+                                            - padS(mi_ni) * jnp.abs(Eiz_u))
+                        + tc.wall_s * jnp.abs(padN(fe_c) - padN(fi_c)
+                                              - padN(mi_ni)
+                                              * jnp.abs(Eiz_u)))
+                    Te_fr = jnp.maximum(padW(Te), padE(Te))
+                    Te_fz = jnp.maximum(padS(Te), padN(Te))
+                    es_r = jnp.maximum(jnp.abs(Er0), Te_fr / tc.dc_r)
+                    es_z = jnp.maximum(jnp.abs(Ez0), Te_fz / tc.dc_z)
+                    rq_r = QE * gw_r / (EPS0 * es_r)
+                    rq_z = QE * gw_z / (EPS0 * es_z)
                 rate_q = jnp.maximum(
                     jnp.maximum(rq_r[1:, :], rq_r[:-1, :]),
                     jnp.maximum(rq_z[:, 1:], rq_z[:, :-1]))
@@ -1775,7 +1976,17 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                                 0.0)
             dt_fr = jnp.maximum(padW(dte), padE(dte))
             dt_fz = jnp.maximum(padS(dte), padN(dte))
-            inv_dt = 1.0 / jnp.where(dte > 0.0, dte, 1.0)
+            # dte = 0 must mean "do not advance this cell", i.e. the
+            # backward-Euler system degenerates to x = ne -- so inv_dt
+            # must be effectively infinite there. The previous guard
+            # (1/where(dte>0, dte, 1)) silently turned dt = 0 into
+            # dt = 1 SECOND, and a single substep at that clock
+            # relaxed the electrons to their one-second steady state
+            # (the it-1047/it-1539 detonations). Double-where keeps
+            # the reverse-mode gradient NaN-free (clip_dt idiom).
+            inv_dt = jnp.where(dte > 0.0,
+                               1.0 / jnp.where(dte > 0.0, dte, 1.0),
+                               1.0e30)
 
             # ---- substep-entry (frozen) sources: S(n^t, Te^t) ----------- #
             if evolve_energy:
@@ -1821,6 +2032,8 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                 rhs = pc.plasma * QE * (ni_p - ne_g) * pc.volume \
                     + rhs_surface(ssr_p, ssz_p) \
                     + aug_matvec(Phi_g, gaug_r, gaug_z)
+                if _asm:
+                    rhs = rhs + bat_rhs(Te_g)
                 Phi_g = psolve(pc, rhs, gaug_r, gaug_z, Phi_g)
 
                 # (b) backward-Euler electron continuity at the NEW
@@ -1856,11 +2069,17 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                     S_eps = S_stat + es_heating(ne, mu_e, Erc, Ezc,
                                                 Fre_s, Fze_s)
                     wf_p = ce * vth_g
+                    # ASM: energy wall multiplier carries the climb
+                    # term at the actual mesh barrier (see sheath_eps_*
+                    # above); particle solves keep br_g/bz_g.
+                    brp_g, bzp_g = ((sheath_eps_r(Phi_g, Te_g),
+                                     sheath_eps_z(Phi_g, Te_g))
+                                    if _asm else (br_g, bz_g))
 
                     def mv_p(x, D_g=D_g, vfr=vfr, vfz=vfz, wf_p=wf_p,
-                             inv_dt=inv_dt):
+                             inv_dt=inv_dt, brp_g=brp_g, bzp_g=bzp_g):
                         Fr, Fz = op_fluxes(x, c53 * D_g, c53 * vfr,
-                                           c53 * vfz, wf_p, br_g, bz_g)
+                                           c53 * vfz, wf_p, brp_g, bzp_g)
                         return jnp.where(tc.active > 0.5,
                                          inv_dt * x + div(Fr, Fz), x)
 
@@ -1868,7 +2087,7 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                     neps_g = imsolve(mv_p, b_p, neps_g,
                                      op_diag(c53 * D_g, c53 * vfr,
                                              c53 * vfz, wf_p, inv_dt,
-                                             br_g, bz_g))
+                                             brp_g, bzp_g))
 
             # ---- final updates: exact discrete charge ledger ------------ #
             # sigma_s MUST be charged from the same fluxes that produced

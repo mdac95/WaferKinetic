@@ -60,6 +60,11 @@ def surfaces(mesh, mask):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--coarse", action="store_true")
+    ap.add_argument("--wall", default="fine", choices=("fine", "asm"),
+                    help="axial wall grading: 'fine' clusters cells at "
+                         "the wafer/window for a mesh-resolved sheath; "
+                         "'asm' drops that clustering (doc P6 carries "
+                         "the sheath analytically)")
     ap.add_argument("--outdir", default="outputs")
     ap.add_argument("--ne", type=float, default=6.6e17,
                     help="density for the lambda_D reference line")
@@ -68,8 +73,8 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
 
-    mesh, mask = gec_setup(coarse=args.coarse) if args.coarse \
-        else gec_setup()
+    mesh, mask = (gec_setup(coarse=True) if args.coarse
+                  else gec_setup(wall=args.wall))
     dr, dz = np.diff(mesh.r_faces), np.diff(mesh.z_faces)
     lam_D = 7430.0 * np.sqrt(args.te / args.ne)
 
@@ -126,8 +131,9 @@ def main():
     a.legend(fontsize=8); a.grid(alpha=0.3)
 
     fig.tight_layout()
-    path = os.path.join(args.outdir,
-                        f"mesh{'_coarse' if args.coarse else ''}.png")
+    tag = "_coarse" if args.coarse else \
+        ("_asmwall" if args.wall == "asm" else "")
+    path = os.path.join(args.outdir, f"mesh{tag}.png")
     fig.savefig(path, dpi=140, bbox_inches="tight")
     plt.close(fig)
     print(f"\nwrote {path}")
