@@ -136,7 +136,7 @@ def backend_banner():
 
 
 def run(args):
-    mesh, mask = gec_setup()
+    mesh, mask = gec_setup(wall=args.wall_mesh)
     case = hybrid.HybridCase(P_set_W=args.power, p_torr=args.pressure)
     setup = hybrid.build_setup(case, mesh, mask, TURNS)
     num = hybrid.HybridNumerics(P_ramp_iters=args.ramp,
@@ -198,7 +198,7 @@ def run(args):
 
 def run_converged(args):
     """Full convergence through `run_hybrid` (acceleration on)."""
-    mesh, mask = gec_setup()
+    mesh, mask = gec_setup(wall=args.wall_mesh)
     case = hybrid.HybridCase(P_set_W=args.power, p_torr=args.pressure)
     setup = hybrid.build_setup(case, mesh, mask, TURNS)
     num = hybrid.HybridNumerics(P_ramp_iters=args.ramp,
@@ -460,6 +460,14 @@ def main():
                          "is the FASTEST variable, not a slow one, so "
                          "extrapolating it amplifies the stepwise-ionization "
                          "runaway at any clamp size")
+    ap.add_argument("--wall-mesh", dest="wall_mesh", default="fine",
+                    choices=("fine", "asm"),
+                    help="axial wall grading (gec_case.gec_setup): 'fine' "
+                         "clusters cells at the wafer/window for a "
+                         "mesh-resolved sheath; 'asm' drops that "
+                         "clustering, which is what --sheath-model asm "
+                         "makes correct AND is where the timestep is "
+                         "(the 0.278 mm wafer row sets the whole clock)")
     ap.add_argument("--sheath-model", dest="sheath_model",
                     default="resolved", choices=("resolved", "asm"),
                     help="doc P6: 'asm' takes the unresolved sheath out "
@@ -550,6 +558,7 @@ def main():
                        f"{'_udt' if args.uniform_dt else ''}"
                        f"{'_sheath' if args.wall_flux == 'sheath' else ''}"
                        f"{'_asm' if args.sheath_model == 'asm' else ''}"
+                       f"{'_cwall' if args.wall_mesh == 'asm' else ''}"
                        f"{'' if args.eetm_slice else '_noeetm'}.log")
     log = os.path.join(args.outdir, log)
     tee = Tee(log)
@@ -580,6 +589,7 @@ def main():
             f"{'_udt' if args.uniform_dt else ''}"
             f"{'_sheath' if args.wall_flux == 'sheath' else ''}"
             f"{'_asm' if args.sheath_model == 'asm' else ''}"
+            f"{'_cwall' if args.wall_mesh == 'asm' else ''}"
             f"{'_bohm' if args.ion_wall == 'bohm' else ''}"
             f"{'_eff' if args.ion_field == 'effective' else ''}"
             f"{'' if args.eetm_slice else '_noeetm'}")

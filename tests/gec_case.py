@@ -29,7 +29,7 @@ TURNS = [(COIL_R0 + k * COIL_PITCH, COIL_R0 + k * COIL_PITCH + COIL_W,
           Z_DIEL_TOP, Z_DIEL_TOP + COIL_H) for k in range(N_TURNS)]
 
 
-def gec_setup(coarse=False):
+def gec_setup(coarse=False, wall="fine"):
     """GEC geometry + mesh, verbatim from demo_gec_icp.py.
 
     coarse=True returns the same geometry on a ~2x coarser mesh (min
@@ -37,7 +37,29 @@ def gec_setup(coarse=False):
     stability floor dt ~ 1/(2 mu_e Te (1/dz^2 + 1/dr^2)) scales with
     the finest cell, and the coupled charged-species stepper must run
     at a UNIFORM pseudo-dt (per-cell local dt destabilizes the coupled
-    field-charge update; see poisson.make_jax_fkpm_stepper notes)."""
+    field-charge update; see poisson.make_jax_fkpm_stepper notes).
+
+    wall="asm" keeps the same geometry and radial grid but removes the
+    AXIAL wall clustering, which existed only to (badly) hold a sheath
+    that the analytic sheath model (doc P6, `sheath_model="asm"`) now
+    carries outside the mesh. Measured on the converged ASM state: the
+    ion-Courant clock is set ENTIRELY by the single 0.278 mm plasma row
+    above the wafer (all 41 cells within 3x of the minimum lie in that
+    row); excluding it, the next binding cell is 29x more permissive --
+    so coarsening that row is the whole speed story.
+
+    What still constrains the axial grid once the sheath is gone:
+      * the inductive skin layer below the window -- the collisional
+        skin depth is 4.6 mm at the converged density, so the window
+        side keeps ~1 mm cells (~5 per skin depth) even though its
+        sheath has also left the mesh;
+      * the ASM self-consistency condition s < dz (Child-Langmuir
+        thickness inside the wall cell), which coarsening makes
+        EASIER, not harder;
+      * neighbour cell-size ratios stay <= ~1.2, so the stepper's
+        pseudo-clock smoothing sweeps have nothing to fight.
+    The radial grid is deliberately left untouched: it is nowhere near
+    binding, so changing it would only confuse the comparison."""
     R_MAX, Z_MIN, Z_MAX = 145 * mm, -40 * mm, 80 * mm
     R_SLAB, Z_SLAB_BOT = 57.5 * mm, 40.0 * mm
     R_STEP, Z_STEP_BOT = 83.5 * mm, 34.0 * mm
@@ -91,6 +113,34 @@ def gec_setup(coarse=False):
             np.linspace(R_AIRBOX, R_PLATE, 6),
             tanh_grid(R_PLATE, R_MAX, n_cells=12, beta=1.4,
                       cluster="both"),
+        ])
+        mesh = Mesh2D(rfaces, zf)
+        return mesh, mesh.material_mask(geo)
+
+    if wall == "asm":
+        # coarse at the wafer (2.1 mm vs 0.278 mm: the clock setter),
+        # moderate below the window (1.0 mm, skin-layer driven)
+        zf = composite_grid([
+            np.linspace(Z_MIN, Z_AIR_BOT_TOP, 5),
+            np.linspace(Z_AIR_BOT_TOP, Z_PED_UP_BOT, 5),
+            np.linspace(Z_PED_UP_BOT, Z_PLATE_BOT, 6),
+            np.linspace(Z_PLATE_BOT, Z_PLATE_TOP, 4),
+            geometric_grid(Z_PLATE_TOP, 0.5 * (Z_PLATE_TOP + Z_SLAB_BOT),
+                           2.2 * mm, 1.10, "start"),
+            geometric_grid(0.5 * (Z_PLATE_TOP + Z_SLAB_BOT), Z_STEP_BOT,
+                           1.2 * mm, 1.18, "end"),
+            np.linspace(Z_STEP_BOT, Z_SLAB_BOT, 7),
+            np.linspace(Z_SLAB_BOT, Z_DIEL_TOP, 7),
+            np.linspace(Z_DIEL_TOP, Z_DIEL_TOP + COIL_H, 3),
+            geometric_grid(Z_DIEL_TOP + COIL_H, Z_MAX, 1.5 * mm, 1.25,
+                           "start"),
+        ])
+        rfaces = composite_grid([
+            tanh_grid(0.0, R_WAFER, n_cells=26, beta=1.2, cluster="end"),
+            np.linspace(R_WAFER, R_SLAB, 5),
+            np.linspace(R_SLAB, R_AIRBOX, 5),
+            np.linspace(R_AIRBOX, R_PLATE, 8),
+            tanh_grid(R_PLATE, R_MAX, n_cells=20, beta=1.6, cluster="both"),
         ])
         mesh = Mesh2D(rfaces, zf)
         return mesh, mesh.material_mask(geo)

@@ -1846,18 +1846,70 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                     clip_dt(dti0, stab_rate(
                         p.D_i * jnp.ones_like(ne),
                         p.mu_i * jnp.ones_like(ne), Eir_u, Eiz_u)))
-                # sheath-RC charging limit. ASM: net charging current
-                # with the DYNAMIC barrier -- throttled electron flux
-                # minus the Bohm ion flux (reduces to u_B |ne - ni|
-                # once the face drop reaches the analytic equilibrium).
-                # The differential response d(Ge)/dPhi = Ge/Te is
-                # u_B-scale: ~143x softer than the resolved thermal
-                # response, so this clip stays far from binding.
-                # Resolved path: verbatim from the explicit body.
+                # Explicit surface-charge (sigma_s) stability -- the
+                # limit that BINDS once P6 takes the sheath out of the
+                # mesh. The quantity is the DIFFERENTIAL conductance
+                # dGamma_e/dPhi = Gamma_e/Te, never the net current:
+                # the barrier drives the net current to zero at the
+                # ambipolar balance, so a net-current estimate reports
+                # "no limit" exactly where the feedback loop is
+                # stiffest. (The resolved path's net-current estimate
+                # has the same defect, documented as ~6x too
+                # permissive; on the ASM path it is unbounded, and the
+                # run detonates once the density has grown enough --
+                # measured: ne * dt at failure is constant.)
+                # Linearising the face charge against its own potential
+                # response,
+                #   d(dsigma)/dt = -q (dGamma_e/dPhi)(dPhi/dsigma) dsigma,
+                #   dPhi/dsigma  = A/g   (exact face conductance, so the
+                #                         dielectric permittivity counts)
+                # gives rate = q Gamma_e A / (g Te). Restricted to the
+                # dielectric faces: grounded metal holds Phi by
+                # Dirichlet, so no explicit surface-charge loop exists
+                # there. NOTE the rate GROWS with cell size (a thicker
+                # capacitor gap is more volts per coulomb) -- the
+                # opposite of the ion Courant bound, so coarsening the
+                # wall cells trades one limit for the other.
                 if _asm:
                     fe_c = cp * vth_e * ne
-                    fi_c = _uB(jnp.maximum(Te, p.Te_min)) * ni
                     brq, bzq = sheath_r(Phi, Te), sheath_z(Phi, Te)
+                    ge_r = brq * (tc.wall_e * padW(fe_c)
+                                  + tc.wall_w * padE(fe_c))
+                    ge_z = bzq * (tc.wall_n * padS(fe_c)
+                                  + tc.wall_s * padN(fe_c))
+                    Te_fr = jnp.maximum(padW(Te), padE(Te))
+                    Te_fz = jnp.maximum(padS(Te), padN(Te))
+                    gr_safe = jnp.where(pc.g_r > 0.0, pc.g_r, 1.0)
+                    gz_safe = jnp.where(pc.g_z > 0.0, pc.g_z, 1.0)
+                    rq_r = jnp.where(
+                        pc.g_r > 0.0,
+                        QE * (pc.scE_r + pc.scW_r) * ge_r * pc.area_r
+                        / (gr_safe * Te_fr), 0.0)
+                    rq_z = jnp.where(
+                        pc.g_z > 0.0,
+                        QE * (pc.scN_z + pc.scS_z) * ge_z * pc.area_z
+                        / (gz_safe * Te_fz), 0.0)
+                    # This rate IS the linear relaxation rate lambda of
+                    # the surface-charge mode, so its stability bound is
+                    # the explicit-Euler one, lambda*dt < 2 -- not a
+                    # Courant number. Clip at lambda*dt <= 1 (a factor-2
+                    # margin). Calibration: at the converged fine-mesh
+                    # ASM state lambda = 4.5e9 /s and the run is stable
+                    # at dt = 1.4e-10, i.e. lambda*dt = 0.64, so 1.0 is
+                    # the right order and courant_clip (0.4) would
+                    # needlessly slow the working path by ~1.6x.
+                    rate_sig = jnp.maximum(
+                        jnp.maximum(rq_r[1:, :], rq_r[:-1, :]),
+                        jnp.maximum(rq_z[:, 1:], rq_z[:, :-1]))
+                    safe_sig = jnp.where(rate_sig > 0.0, rate_sig, 1.0)
+                    dte = jnp.where(rate_sig > 0.0,
+                                    jnp.minimum(dte, 1.0 / safe_sig), dte)
+                    # ... and KEEP the net-current estimate as transient
+                    # protection: far from the ambipolar balance (during
+                    # ignition, or after any kick) the gross imbalance is
+                    # the larger rate, and dropping it made a run fail
+                    # EARLIER, not later.
+                    fi_c = _uB(jnp.maximum(Te, p.Te_min)) * ni
                     gw_r = (tc.wall_e * jnp.abs(brq * padW(fe_c)
                                                 - padW(fi_c))
                             + tc.wall_w * jnp.abs(brq * padE(fe_c)
@@ -1866,7 +1918,12 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                                                 - padS(fi_c))
                             + tc.wall_s * jnp.abs(bzq * padN(fe_c)
                                                   - padN(fi_c)))
+                    es_r = jnp.maximum(jnp.abs(Er0), Te_fr / tc.dc_r)
+                    es_z = jnp.maximum(jnp.abs(Ez0), Te_fz / tc.dc_z)
+                    rq_r = QE * gw_r / (EPS0 * es_r)
+                    rq_z = QE * gw_z / (EPS0 * es_z)
                 else:
+                    # resolved path: verbatim from the explicit body
                     fe_c = cp * vth_e * ne
                     if ion_wall == "bohm":
                         fi_c = jnp.maximum(
@@ -1888,12 +1945,12 @@ def make_jax_fkpm_stepper(tc: TransportCoeffsJAX, pc: PoissonCoeffsJAX,
                         + tc.wall_s * jnp.abs(padN(fe_c) - padN(fi_c)
                                               - padN(mi_ni)
                                               * jnp.abs(Eiz_u)))
-                Te_fr = jnp.maximum(padW(Te), padE(Te))
-                Te_fz = jnp.maximum(padS(Te), padN(Te))
-                es_r = jnp.maximum(jnp.abs(Er0), Te_fr / tc.dc_r)
-                es_z = jnp.maximum(jnp.abs(Ez0), Te_fz / tc.dc_z)
-                rq_r = QE * gw_r / (EPS0 * es_r)
-                rq_z = QE * gw_z / (EPS0 * es_z)
+                    Te_fr = jnp.maximum(padW(Te), padE(Te))
+                    Te_fz = jnp.maximum(padS(Te), padN(Te))
+                    es_r = jnp.maximum(jnp.abs(Er0), Te_fr / tc.dc_r)
+                    es_z = jnp.maximum(jnp.abs(Ez0), Te_fz / tc.dc_z)
+                    rq_r = QE * gw_r / (EPS0 * es_r)
+                    rq_z = QE * gw_z / (EPS0 * es_z)
                 rate_q = jnp.maximum(
                     jnp.maximum(rq_r[1:, :], rq_r[:-1, :]),
                     jnp.maximum(rq_z[:, 1:], rq_z[:, :-1]))
