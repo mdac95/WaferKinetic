@@ -243,15 +243,21 @@ def sheath_factors(op: TransportOperator, Phi: np.ndarray, Te: np.ndarray,
 def wall_energy_power(op: TransportOperator, n_eps: np.ndarray,
                       Te: np.ndarray, p: ElectronParams,
                       Phi: np.ndarray | None = None,
-                      wall_flux: str = "thermal") -> float:
+                      wall_flux: str = "thermal",
+                      barrier: float | None = None) -> float:
     """Total electron energy loss to walls (W), doc Eq. 36 second relation.
     Wall fluxes are oriented outward, so the total is sum(A |F|) q.
     Pass `Phi` with wall_flux="sheath" to apply the Boltzmann throttle --
     it MUST match the form the stepper used or the ledger is meaningless.
+    `barrier` (doc P6 / ASM): constant analytic-barrier multiplier
+    exp(-CHI) applied to the thermal flux instead; supersedes the Phi
+    throttle when given.
     """
     ce = WALL_ENERGY * (1.0 - p.re) / (1.0 + p.re)
     Wr, Wz = wall_flux_thermal(op, n_eps, thermal_speed(Te), ce)
-    if wall_flux == "sheath" and Phi is not None:
+    if barrier is not None:
+        Wr, Wz = barrier * Wr, barrier * Wz
+    elif wall_flux == "sheath" and Phi is not None:
         br, bz = sheath_factors(op, Phi, Te, p.Te_min)
         Wr, Wz = br * Wr, bz * Wz
     return float((np.sum(op.area_r * np.abs(Wr))

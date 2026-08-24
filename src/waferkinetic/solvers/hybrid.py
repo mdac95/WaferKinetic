@@ -349,6 +349,23 @@ class HybridNumerics:
     # between its source terms and the FKPM's is an uncounted source in
     # the loop. Set False to drop it and let the FKPM own the energy.
     eetm_slice: bool = True
+    # Doc P6 / analytic sheath model (ASM): "resolved" leaves every
+    # wall flux and the Poisson boundary as-is; "asm" takes the
+    # unresolved sheath out of the mesh -- ion wall flux n u_B (Bohm
+    # criterion, replaces Eq. 37), electron wall flux throttled by the
+    # analytic floating barrier dPhi_b = ln(c_p vth_e/u_B) Te = 4.97 Te
+    # for argon (equal to n u_B exactly), the SAME barrier on ALL
+    # surfaces (grounded metal included: per-face zero net DC current
+    # at steady state -- a stated approximation that suppresses
+    # wall-current circulation; revisit for RF bias), and the Eq. 34
+    # battery jump in the Poisson RHS so the mesh sees the sheath edge.
+    # sigma_s dynamics is RETAINED: with no Phi dependence left in the
+    # wall fluxes its charging current is the benign quasineutrality
+    # residual u_B |ne - ni|, so the sheath-RC clip (re-based on that
+    # residual) loses its premise at steady state. Supersedes
+    # `wall_flux` when "asm". Requires implicit_electrons=True and
+    # eetm_slice=False.
+    sheath_model: str = "resolved"
     implicit_electrons: bool = False
     n_gummel: int = 2                 # Gummel sweeps per FKPM substep
     implicit_tol: float = 1.0e-9      # BiCGStab tol of the implicit solves
@@ -515,6 +532,15 @@ class HybridDrivers:
     def __init__(self, setup: HybridSetup, num: HybridNumerics):
         import jax.numpy as jnp
 
+        if num.sheath_model == "asm":
+            if not num.implicit_electrons:
+                raise ValueError("sheath_model='asm' requires "
+                                 "implicit_electrons=True (the explicit "
+                                 "stepper is kept verbatim)")
+            if num.eetm_slice:
+                raise ValueError("sheath_model='asm' requires "
+                                 "eetm_slice=False (the standalone EETM "
+                                 "wall flux carries no barrier)")
         self.setup, self.num = setup, num
         self._jnp = jnp
         self._icoef = inductive.to_jax(setup.iop)
@@ -580,7 +606,8 @@ class HybridDrivers:
             ion_wall=self.num.ion_wall, ion_field=self.num.ion_field,
             implicit_electrons=self.num.implicit_electrons,
             n_gummel=self.num.n_gummel, im_tol=self.num.implicit_tol,
-            im_maxiter=self.num.implicit_maxiter)
+            im_maxiter=self.num.implicit_maxiter,
+            sheath_model=self.num.sheath_model)
         self._eetm = electron_energy.make_jax_energy_stepper(
             self._tc, setup.eparams, inelastic_fn=inelastic_fn,
             n_sub=self.num.n_sub_eetm, es_joule=self.num.es_joule)
@@ -694,6 +721,28 @@ def _local_dts(setup: HybridSetup, num: HybridNumerics, state: HybridState,
                                   cfl=num.cfl)
         dt_e = np.where(top.active, np.minimum(dt_e, dt_chem), 0.0)
 
+    if num.sheath_model == "asm":
+        # ASM: the dt_i ceiling must see the sheath-edge field, not the
+        # battery-jump differencing across plasma-boundary faces
+        # (~dPhi_b/dc, a field no ASM flux uses); under uniform_dt one
+        # wafer face would otherwise collapse the global clock ~10x
+        # below the resolved path. Mirrors the stepper's `efield_se`.
+        pop_ = setup.pop
+        cp_e = 0.5 * (1.0 - p.re) / (1.0 + p.re)
+        M_i = 8.0 * QE * p.T_i_eV / (np.pi * p.vth_i ** 2)
+        chi = float(np.log(cp_e * np.sqrt(8.0 * M_i / (np.pi * ME))))
+        live_r = (pop_.g_r > 0.0).astype(float)
+        live_z = (pop_.g_z > 0.0).astype(float)
+        bW_r = pop_.wpl_r * (1.0 - pop_.epl_r) * live_r
+        bE_r = pop_.epl_r * (1.0 - pop_.wpl_r) * live_r
+        bS_z = pop_.spl_z * (1.0 - pop_.npl_z) * live_z
+        bN_z = pop_.npl_z * (1.0 - pop_.spl_z) * live_z
+        TeW, TeE = transport._face_vals_r(Te)
+        TeS, TeN = transport._face_vals_z(Te)
+        Er = Er + (bE_r - bW_r) * chi * (bW_r * TeW + bE_r * TeE) \
+            / pop_.dcp_r
+        Ez = Ez + (bN_z - bS_z) * chi * (bS_z * TeS + bN_z * TeN) \
+            / pop_.dcp_z
     if num.ion_field == "effective" and state.Ei_r is not None:
         # the ion Courant ceiling must bound the field the ions actually
         # drift in, and the effective field is far smaller in the sheath
@@ -712,6 +761,15 @@ def _local_dts(setup: HybridSetup, num: HybridNumerics, state: HybridState,
                      * (Te - case.Tg_eV), 0.0)
     dt_sink = num.chem_safety * np.maximum(state.n_eps, 0.0) \
         / np.maximum(L, tiny)
+    # A cell whose energy density has decayed to EXACTLY zero (the
+    # quiescent pedestal pocket under ASM) has nothing left to drain,
+    # so the sink cap must be INACTIVE there -- not zero. dt_sink = 0
+    # is lethal in combination with uniform_dt (the global min becomes
+    # 0 for every cell) and the implicit solve's inv_dt guard (which
+    # read dt = 0 as dt = 1 s): one substep then relaxed the electrons
+    # to their 1-second steady state and detonated the run (observed
+    # twice, at outer iterations 1047 and 1539).
+    dt_sink = np.where(dt_sink > 0.0, dt_sink, np.inf)
     if num.implicit_electrons:
         # P3: no explicit energy-transport bound. dt_sink alone is NOT a
         # usable cap -- where the net loss L is small it returns
@@ -776,7 +834,8 @@ def _ars_dt(setup: HybridSetup, num: HybridNumerics, state: HybridState,
 
 def power_ledger(setup: HybridSetup, state: HybridState,
                  Q: np.ndarray, es_joule: str = "drift",
-                 wall_flux: str = "thermal") -> dict:
+                 wall_flux: str = "thermal",
+                 sheath_model: str = "resolved") -> dict:
     """Global power ledger, mirroring the FKPM stepper's discretization
     term by term (same Te clamps, same interior-face-restricted ES Joule
     field, same wall coefficients) so the residual measures convergence,
@@ -793,9 +852,58 @@ def power_ledger(setup: HybridSetup, state: HybridState,
     Te = electron_energy.temperature(state.ne, state.n_eps, setup.eparams)
 
     P_in = float(np.sum(Q * V * act))
-    P_wall = electron_energy.wall_energy_power(
-        top, np.where(act, state.n_eps, 0.0), Te, setup.eparams,
-        Phi=state.Phi, wall_flux=wall_flux)
+    fp = setup.fkpm_params
+    if sheath_model == "asm":
+        # ASM electron energy wall power with the DYNAMIC barrier
+        # multiplier exp(-x)(1 + 0.4 x), x = dPhi_face/Te -- 2Te wall
+        # arrival plus the climb spent against the actual mesh face
+        # drop (mirrors the stepper's `sheath_eps_r`/`sheath_eps_z`).
+        # P_ion_wall = Gamma_i q (dPhi_face + 0.5 Te): the ion sheath +
+        # presheath energy channel, REPORTED as a cross-check like
+        # P_ars_wall, not a term of the electron-energy identity.
+        fp = setup.fkpm_params
+        M_i = 8.0 * QE * fp.T_i_eV / (np.pi * fp.vth_i ** 2)
+        ce = electron_energy.WALL_ENERGY * (1.0 - fp.re) / (1.0 + fp.re)
+        vth_e = np.sqrt(8.0 * QE * Te / (np.pi * ME))
+        f = ce * vth_e * np.where(act, state.n_eps, 0.0)
+        fW, fE = transport._face_vals_r(f)
+        fS, fN = transport._face_vals_z(f)
+        PW, PE = transport._face_vals_r(state.Phi)
+        PS, PN = transport._face_vals_z(state.Phi)
+        TW, TE = transport._face_vals_r(np.maximum(Te, fp.Te_min))
+        TS, TN = transport._face_vals_z(np.maximum(Te, fp.Te_min))
+        TW = np.where(TW > 0, TW, 1.0)
+        TE = np.where(TE > 0, TE, 1.0)
+        TS = np.where(TS > 0, TS, 1.0)
+        TN = np.where(TN > 0, TN, 1.0)
+        xE = np.maximum(PW - PE, 0.0) / TW      # wall_e: plasma west
+        xW = np.maximum(PE - PW, 0.0) / TE
+        xN = np.maximum(PS - PN, 0.0) / TS
+        xS = np.maximum(PN - PS, 0.0) / TN
+        mult = lambda x: np.exp(-x) * (1.0 + 0.4 * x)
+        Wr = np.where(top.wall_e, mult(xE) * fW, 0.0) \
+            + np.where(top.wall_w, mult(xW) * fE, 0.0)
+        Wz = np.where(top.wall_n, mult(xN) * fS, 0.0) \
+            + np.where(top.wall_s, mult(xS) * fN, 0.0)
+        P_wall = float((np.sum(top.area_r * Wr)
+                        + np.sum(top.area_z * Wz)) * QE)
+        ub = np.sqrt(QE * np.maximum(Te, fp.Te_min) / M_i)
+        g = np.where(act, ub * state.ni, 0.0)
+        gW, gE = transport._face_vals_r(g)
+        gS, gN = transport._face_vals_z(g)
+        P_ion_wall = QE * float(
+            np.sum(top.area_r
+                   * (np.where(top.wall_e, gW * (xE + 0.5) * TW, 0.0)
+                      + np.where(top.wall_w, gE * (xW + 0.5) * TE, 0.0)))
+            + np.sum(top.area_z
+                     * (np.where(top.wall_n, gS * (xN + 0.5) * TS, 0.0)
+                        + np.where(top.wall_s, gN * (xS + 0.5) * TN,
+                                   0.0))))
+    else:
+        P_wall = electron_energy.wall_energy_power(
+            top, np.where(act, state.n_eps, 0.0), Te, setup.eparams,
+            Phi=state.Phi, wall_flux=wall_flux)
+        P_ion_wall = 0.0
     P_el = QE * float(np.sum(3.0 * case.mass_ratio * case.nu_m * state.ne
                              * (Te - case.Tg_eV) * V * act))
 
@@ -837,7 +945,7 @@ def power_ledger(setup: HybridSetup, state: HybridState,
                 P_inel=P_inel, channels=channels, residual=resid,
                 imbalance=abs(resid) / max(P_in, 1.0e-30),
                 imbalance_no_es=abs(resid - P_es) / max(P_in, 1.0e-30),
-                P_ars_wall=P_ars_wall)
+                P_ars_wall=P_ars_wall, P_ion_wall=P_ion_wall)
 
 
 # ----------------------------------------------------------------------------
@@ -922,9 +1030,89 @@ def ramp_fraction(num: HybridNumerics, it: int | None) -> float:
     return f0 ** (1.0 - (it - 1) / max(N - 1, 1))
 
 
+class StageTimer:
+    """Wall-clock accounting per module, accumulated across the run.
+
+    JAX dispatch is asynchronous, so a naive timer measures dispatch,
+    not compute. Each stage therefore blocks on its own result before
+    the clock is read (`block_until_ready` on one representative array),
+    which is what makes the shares meaningful. Compile time is charged
+    to the iteration that triggered it and reported separately, since a
+    chemistry re-bake retraces the whole FKPM stepper and would
+    otherwise look like a physics cost.
+    """
+
+    STAGES = ("emm", "chem_rebake", "eetm", "fkpm", "ars",
+              "ledger", "other")
+
+    def __init__(self):
+        self.t = {k: 0.0 for k in self.STAGES}
+        self.n = {k: 0 for k in self.STAGES}
+        self.first = {k: 0.0 for k in self.STAGES}   # first call = +compile
+        self._t0 = None
+        self._stage = None
+
+    def start(self, stage):
+        self._stage, self._t0 = stage, time.perf_counter()
+
+    def stop(self, block=None):
+        if self._stage is None:
+            return
+        if block is not None:
+            try:                      # force completion of async dispatch
+                np.asarray(block)
+            except Exception:         # noqa: BLE001 - timing must not fail
+                pass
+        dt = time.perf_counter() - self._t0
+        if self.n[self._stage] == 0:
+            self.first[self._stage] = dt
+        self.t[self._stage] += dt
+        self.n[self._stage] += 1
+        self._stage = None
+
+    def total(self):
+        return sum(self.t.values())
+
+    def steady(self, k):
+        """Time excluding the first call of that stage, which carries
+        JIT compilation and would otherwise dominate short runs."""
+        return self.t[k] - self.first[k], max(self.n[k] - 1, 0)
+
+    def report(self, n_iter=None):
+        tot = self.total()
+        if tot <= 0.0:
+            return "no timing recorded"
+        rows = sorted(self.t.items(), key=lambda kv: -kv[1])
+        w = max(len(k) for k in self.t)
+        tot_ss = sum(self.steady(k)[0] for k in self.t)
+        out = [f"{'stage':<{w}}  {'total_s':>9s} {'share':>7s} "
+               f"{'calls':>7s} {'s/call':>9s} | {'steady_s':>9s} "
+               f"{'share':>7s} {'s/call':>9s}   (steady = excl. 1st call"
+               f" = excl. JIT)"]
+        for k, v in rows:
+            if self.n[k] == 0 and v == 0.0:
+                continue
+            ss, nss = self.steady(k)
+            out.append(
+                f"{k:<{w}}  {v:9.2f} {100 * v / tot:6.1f}% "
+                f"{self.n[k]:7d} {v / max(self.n[k], 1):9.4f} | "
+                f"{ss:9.2f} {100 * ss / max(tot_ss, 1e-30):6.1f}% "
+                f"{ss / max(nss, 1):9.4f}")
+        out.append(f"{'TOTAL':<{w}}  {tot:9.2f} {100.0:6.1f}%"
+                   f"{'':>18s} | {tot_ss:9.2f} {100.0:6.1f}%")
+        out.append(f"{'compile (1st calls)':<{w}}  "
+                   f"{tot - tot_ss:9.2f} {100 * (tot - tot_ss) / tot:6.1f}%")
+        if n_iter:
+            out.append(f"{'per outer iteration':<{w}}  "
+                       f"{tot / n_iter:9.3f} s")
+        return "\n".join(out)
+
+
 def outer_iteration(setup: HybridSetup, num: HybridNumerics,
                     drv: HybridDrivers, state: HybridState,
-                    it: int | None = None) -> tuple[HybridState, dict]:
+                    it: int | None = None,
+                    timer: "StageTimer | None" = None
+                    ) -> tuple[HybridState, dict]:
     """EMM (power-controlled) -> chem refresh check -> EETM relaxation
     -> FKPM(+EETM sub-sliced) slice -> Ar* slice. Returns the new state
     (pre-acceleration) and a diagnostics dict including the ledger."""
@@ -933,6 +1121,8 @@ def outer_iteration(setup: HybridSetup, num: HybridNumerics,
     # ---- 1. EMM with re-entry threshold + Sec. 3.3 power control -------- #
     sigma = inductive.cold_plasma_sigma(state.ne, case.nu_m, case.omega)
     emm_refreshed = False
+    if timer is not None:
+        timer.start("emm")
     if drv.emm_drift(state) > num.emm_thr:
         A = drv.solve_emm(sigma, state.I_coil)
         state = replace(state, A=A, ne_emm=state.ne.copy())
@@ -952,7 +1142,12 @@ def outer_iteration(setup: HybridSetup, num: HybridNumerics,
     S_ext = setup.active_f * Q / QE                # eV m^-3 s^-1
 
     # ---- chemistry re-entry check (rebakes FKPM + EETM closures) -------- #
+    if timer is not None:
+        timer.stop()          # P_dep above already forced completion
+        timer.start("chem_rebake")
     chem_refreshed = drv.refresh_chem(state.n_ars)
+    if timer is not None:
+        timer.stop()
 
     # ---- 2. EETM relaxation at frozen ne (Sec. 12.3 step 3) ------------- #
     Er, Ez = setup.pop.efield(state.Phi)
@@ -978,8 +1173,12 @@ def outer_iteration(setup: HybridSetup, num: HybridNumerics,
     # ---- 3. FKPM slice, EETM sub-sliced inside (Sec. 12.3 step 4) ------- #
     Te = electron_energy.temperature(state.ne, state.n_eps, setup.eparams)
     dt_e, dt_i, dt_eps = _local_dts(setup, num, state, Te, Er, Ez)
+    if timer is not None:
+        timer.start("fkpm")
     ne, ni, n_eps, ss_r, ss_z, Phi = drv.fkpm_step(state, dt_e, dt_i,
                                                    dt_eps, S_ext)
+    if timer is not None:
+        timer.stop(block=ne)
     state = replace(state, ne=ne, ni=ni, n_eps=n_eps,
                     ss_r=ss_r, ss_z=ss_z, Phi=Phi)
     if drv.last_Ei is not None:
@@ -987,13 +1186,20 @@ def outer_iteration(setup: HybridSetup, num: HybridNumerics,
 
     # ---- 4. Ar* slice at frozen (ne, Te, Ar+) --------------------------- #
     Te = electron_energy.temperature(state.ne, state.n_eps, setup.eparams)
+    if timer is not None:
+        timer.start("ars")
     n_ars = drv.ars_step(state.n_ars, state.ne, Te, state.ni,
                          _ars_dt(setup, num, state, Te))
+    if timer is not None:
+        timer.stop(block=n_ars)
     state = replace(state, n_ars=n_ars)
 
     # ---- diagnostics ----------------------------------------------------- #
+    if timer is not None:
+        timer.start("ledger")
     ledger = power_ledger(setup, state, Q, es_joule=num.es_joule,
-                          wall_flux=num.wall_flux)
+                          wall_flux=num.wall_flux,
+                          sheath_model=num.sheath_model)
     pen, _ = field_penetration_depth(setup, Q)
     act = setup.top.active
     # UNCLIPPED mean energy. `temperature()` clamps at Te_max, so a
@@ -1062,6 +1268,8 @@ def outer_iteration(setup: HybridSetup, num: HybridNumerics,
         # measured in-loop advance of the slice just taken (s)
         slice_advance=float(drv.last_slice_advance),
         emm_refreshed=emm_refreshed, chem_refreshed=chem_refreshed)
+    if timer is not None:
+        timer.stop()
     return state, diag
 
 
@@ -1113,6 +1321,7 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
     converged = False
 
     ramp_step = 1
+    timer = StageTimer()
     accel_since = None                 # first iteration acceleration applied
     applied_accel_prev = False
     for it in range(1, num.max_outer + 1):
@@ -1121,11 +1330,15 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
         last_good = state
         try:
             state, diag = outer_iteration(setup, num, drivers, state,
-                                          ramp_step)
+                                          ramp_step, timer=timer)
         except RuntimeError as exc:
             print(f"[{it:4d}] outer_iteration failed: {exc}")
             print("       returning the last finite state; history is "
                   "complete up to the previous iteration.")
+            run_hybrid.last_timer = timer
+            if verbose:
+                print("\n--- wall-clock by module (run ended early) ---")
+                print(timer.report(n_iter=max(len(history), 1)))
             return last_good, history, False
         # A diverged iteration poisons everything downstream, and the
         # symptom surfaces later as a confusing "EMM deposited no power"
@@ -1154,6 +1367,10 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
                   f"{'yes' if applied_accel_prev else 'no'}.")
             print("       returning the last finite state (iteration "
                   f"{it - 1}).")
+            run_hybrid.last_timer = timer
+            if verbose:
+                print("\n--- wall-clock by module (run ended early) ---")
+                print(timer.report(n_iter=max(len(history), 1)))
             return last_good, history, False
 
         # -- convergence metric on the pre-acceleration physics state ------ #
@@ -1269,6 +1486,11 @@ def run_hybrid(setup: HybridSetup, num: HybridNumerics | None = None,
         print(f"run_hybrid: {tag} after {len(history)} outer iterations "
               f"({drivers.n_emm_solves} EMM solves, "
               f"{drivers.n_chem_bakes} chemistry bakes)")
+    if verbose:
+        print("\n--- wall-clock by module "
+              "(blocking timers; compile charged to chem_rebake) ---")
+        print(timer.report(n_iter=len(history)))
+    run_hybrid.last_timer = timer          # for callers/post-processing
     return state, history, converged
 
 

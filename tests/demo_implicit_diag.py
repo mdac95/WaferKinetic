@@ -100,6 +100,9 @@ def check_module_versions():
     if "ion_field" not in inspect.signature(
             hybrid.poisson.make_jax_fkpm_stepper).parameters:
         msgs.append("poisson.py is STALE (no ion_field on the stepper)")
+    if "sheath_model" not in inspect.signature(
+            hybrid.poisson.make_jax_fkpm_stepper).parameters:
+        msgs.append("poisson.py is STALE (no sheath_model on the stepper)")
     if not hasattr(hybrid.HybridNumerics, "ion_field") and \
             "ion_field" not in {f.name for f in
                                 __import__("dataclasses")
@@ -143,12 +146,15 @@ def run(args):
                                 P_ramp_frac0=args.ramp_frac0,
                                 chem_thr=args.chem_thr,
                                 dt_imp_max=args.dt_cap,
+                                implicit_tol=args.im_tol,
+                                cg_tol=args.cg_tol,
                                 n_gummel=args.n_gummel,
                                 wall_flux=args.wall_flux,
                                 use_accel=args.use_accel,
                                 ion_wall=args.ion_wall,
                                 ion_field=args.ion_field,
                                 n_sub_fkpm=args.n_sub,
+                                sheath_model=args.sheath_model,
                                 implicit_electrons=not args.explicit)
     drv = hybrid.HybridDrivers(setup, num)
     state = hybrid.seed_state(setup)
@@ -204,12 +210,15 @@ def run_converged(args):
                                 P_ramp_frac0=args.ramp_frac0,
                                 chem_thr=args.chem_thr,
                                 dt_imp_max=args.dt_cap,
+                                implicit_tol=args.im_tol,
+                                cg_tol=args.cg_tol,
                                 n_gummel=args.n_gummel,
                                 n_sub_fkpm=args.n_sub,
                                 wall_flux=args.wall_flux,
                                 use_accel=args.use_accel,
                                 ion_wall=args.ion_wall,
                                 ion_field=args.ion_field,
+                                sheath_model=args.sheath_model,
                                 implicit_electrons=not args.explicit)
     path = "explicit" if args.explicit else "implicit"
     print(f"=== {path} path -> run_hybrid, wall_flux='{args.wall_flux}', "
@@ -248,6 +257,25 @@ def run_converged(args):
     nb = sum(1 for h in hist if h["chem_refreshed"])
     print(f"  chemistry re-bakes (JIT retraces): {nb} of {len(hist)} "
           f"iterations -- each one recompiles the whole FKPM stepper")
+    tmr = getattr(hybrid.run_hybrid, "last_timer", None)
+    if tmr is not None:
+        print("\n--- WHERE THE TIME GOES (per module) "
+              "-------------------------------")
+        print(tmr.report(n_iter=max(len(hist), 1)))
+        ss = {k: tmr.steady(k)[0] for k in tmr.STAGES}
+        tot = sum(ss.values())
+        if tot > 0:
+            top = max(ss, key=ss.get)
+            rest = sorted((v for k, v in ss.items() if k != top),
+                          reverse=True)
+            second = rest[0] if rest and rest[0] > 0 else 0.0
+            factor = (ss[top] / second) if second > 0 else float("inf")
+            print(f"\n  bottleneck (steady state): '{top}' at "
+                  f"{100 * ss[top] / tot:.1f}% of compute"
+                  + (f", {factor:.0f}x the next stage"
+                     if second > 0 else " (everything else is noise)"))
+            print("  -> optimisation effort anywhere else is capped by "
+                  f"Amdahl at {100 * (1 - ss[top] / tot):.1f}%")
     if ok:
         led = hist[-1]
         print(f"  final ledger imbalance {led['imbalance']:.3%}; "
@@ -260,7 +288,7 @@ def run_converged(args):
 
 
 def save_fields(setup, state, path, ion_wall="thermal",
-                wall_flux="thermal"):
+                wall_flux="thermal", sheath_model="resolved"):
     """(ion Er/Ez override and E_eff dump handled below)"""
     """Dump the grid and every field to a compressed .npz. Called on the
     state `run_hybrid` hands back -- which on a divergence is the LAST
@@ -278,7 +306,12 @@ def save_fields(setup, state, path, ion_wall="thermal",
     (Fr_e, Fz_e), (Fr_i, Fz_i) = hybrid.poisson._species_fluxes(
         top, pop, state.ne, state.ni, Te, Er, Ez, setup.fkpm_params,
         ion_wall=ion_wall, wall_flux=wall_flux, Phi=state.Phi,
-        Er_i=state.Ei_r, Ez_i=state.Ei_z)
+        Er_i=state.Ei_r, Ez_i=state.Ei_z, sheath_model=sheath_model)
+    fp = setup.fkpm_params
+    M_i = 8.0 * hybrid.QE * fp.T_i_eV / (np.pi * fp.vth_i ** 2)
+    cp_e = 0.5 * (1.0 - fp.re) / (1.0 + fp.re)
+    chi = (float(np.log(cp_e * np.sqrt(8.0 * M_i / (np.pi * hybrid.ME))))
+           if sheath_model == "asm" else 0.0)
     np.savez_compressed(
         path,
         # ---- grid ------------------------------------------------------
@@ -292,6 +325,10 @@ def save_fields(setup, state, path, ion_wall="thermal",
         eps_bar=np.where(act, state.n_eps
                          / np.maximum(state.ne, setup.case.ne_floor), 0.0),
         Q_ind=Q, I_coil=np.float64(state.I_coil),
+        # doc P6 tag: chi > 0 marks an ASM dump; the analytic barrier
+        # dPhi_b = chi * Te sits OUTSIDE the mesh (postprocess adds it
+        # to the in-mesh wall drop)
+        chi=np.float64(chi),
         # ---- fields / fluxes (faces) -----------------------------------
         Er=Er, Ez=Ez, ss_r=state.ss_r, ss_z=state.ss_z,
         Ei_r=(state.Ei_r if state.Ei_r is not None else np.zeros(0)),
@@ -423,11 +460,28 @@ def main():
                          "is the FASTEST variable, not a slow one, so "
                          "extrapolating it amplifies the stepwise-ionization "
                          "runaway at any clamp size")
+    ap.add_argument("--sheath-model", dest="sheath_model",
+                    default="resolved", choices=("resolved", "asm"),
+                    help="doc P6: 'asm' takes the unresolved sheath out "
+                         "of the mesh (Bohm ion wall flux, analytic "
+                         "4.97-Te electron barrier on ALL surfaces, "
+                         "Eq. 34 battery jump in Poisson). Requires the "
+                         "implicit path and --no-eetm-slice; supersedes "
+                         "--wall-flux")
     ap.add_argument("--wall-flux", dest="wall_flux", default="thermal",
                     choices=("thermal", "sheath"),
                     help="electron wall flux: 'thermal' is doc Eq. 36; "
                          "'sheath' applies exp(-dPhi/Te) for the "
                          "unresolved sheath and DEPARTS FROM THE DOC")
+    ap.add_argument("--im-tol", dest="im_tol", type=float, default=1.0e-9,
+                    help="BiCGStab tolerance of the implicit electron/energy "
+                         "solves (HybridNumerics.implicit_tol, default 1e-9). "
+                         "The outer iteration floors at rel ~3e-4, so far "
+                         "looser values may resolve the same fixed point "
+                         "at a fraction of the Krylov work")
+    ap.add_argument("--cg-tol", dest="cg_tol", type=float, default=1.0e-8,
+                    help="Poisson CG tolerance (HybridNumerics.cg_tol, "
+                         "default 1e-8)")
     ap.add_argument("--n-gummel", dest="n_gummel", type=int, default=2,
                     help="Gummel block sweeps per FKPM substep (default 2). "
                          "The Phi<->ne coupling stiffens with dt; if the "
@@ -495,6 +549,7 @@ def main():
                        f"{'_conv' if args.converge else ''}"
                        f"{'_udt' if args.uniform_dt else ''}"
                        f"{'_sheath' if args.wall_flux == 'sheath' else ''}"
+                       f"{'_asm' if args.sheath_model == 'asm' else ''}"
                        f"{'' if args.eetm_slice else '_noeetm'}.log")
     log = os.path.join(args.outdir, log)
     tee = Tee(log)
@@ -524,13 +579,15 @@ def main():
             f"{'_conv' if args.converge else ''}"
             f"{'_udt' if args.uniform_dt else ''}"
             f"{'_sheath' if args.wall_flux == 'sheath' else ''}"
+            f"{'_asm' if args.sheath_model == 'asm' else ''}"
             f"{'_bohm' if args.ion_wall == 'bohm' else ''}"
             f"{'_eff' if args.ion_field == 'effective' else ''}"
             f"{'' if args.eetm_slice else '_noeetm'}")
         if plot_maps_ok:
             plot_maps(setup, state, f"{stem}_maps.png")
             save_fields(setup, state, f"{stem}_fields.npz",
-                        ion_wall=args.ion_wall, wall_flux=args.wall_flux)
+                        ion_wall=args.ion_wall, wall_flux=args.wall_flux,
+                        sheath_model=args.sheath_model)
         plot_transient(hist, f"{stem}_transient.png")
 
         last = hist[-1]
